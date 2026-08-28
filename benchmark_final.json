@@ -1,0 +1,38 @@
+{
+  "PPO (trained)": {
+    "safety": 91.5,
+    "coverage": 16.461111111111112,
+    "perimeter": 13.998673864396801,
+    "alive": 9.15
+  },
+  "Greedy": {
+    "safety": 95.5,
+    "coverage": 13.772222222222222,
+    "perimeter": 13.676428309478968,
+    "alive": 9.55
+  },
+  "PID": {
+    "safety": 100.0,
+    "coverage": 9.938888888888888,
+    "perimeter": 1.4484052482159417,
+    "alive": 10.0
+  },
+  "Random": {
+    "safety": 48.0,
+    "coverage": 38.11666666666666,
+    "perimeter": 14.587256718373578,
+    "alive": 4.8
+  },
+  "Lawnmower": {
+    "safety": 86.5,
+    "coverage": 11.88888888888889,
+    "perimeter": 15.559252788410637,
+    "alive": 8.65
+  },
+  "PPO+CBF (MARAHS)": {
+    "safety": 93.0,
+    "coverage": 15.288888888888891,
+    "perimeter": 17.957560907858255,
+    "alive": 9.3
+  }
+}

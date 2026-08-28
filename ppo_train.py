@@ -336,38 +336,40 @@ def compute_reward(drone, prev_visited, total_explored, fire_dist,
     """
     Compute shaped reward for one drone at one step.
     
-    Reward structure:
-      +10 per NEW cell explored (primary exploration driver)
-      +1  per step alive (small survival bonus)
-      +5  for being near fire perimeter (tracking bonus)
-      -3  for revisiting already-explored cells
-      -5  for crashing
+    Reward structure (exploration-dominant):
+      +25 per NEW cell explored (primary driver)
+      +0.05 per step alive (tiny survival nudge)
+      +8  for being near fire perimeter (tracking bonus)
+      -1  for revisiting already-explored cells
+      -15 for crashing
     """
     if crashed:
-        return -5.0
+        return -15.0
 
     reward = 0.0
 
-    # 1. Survival bonus (small, not dominant)
-    reward += 1.0
+    # 1. Survival bonus (tiny - just enough to prefer alive over dead)
+    reward += 0.05
 
-    # 2. Exploration bonus (primary driver: +10 per new cell)
+    # 2. Exploration bonus (DOMINANT: +25 per new cell)
     new_cells = 0
     for cell in drone['visited']:
         if cell not in prev_visited:
             new_cells += 1
-    reward += 10.0 * new_cells
+    reward += 25.0 * new_cells
 
-    # 3. Perimeter tracking bonus (+5 if near fire)
+    # 3. Revisit penalty (mild discouragement)
+    revisit_count = len(drone.get('visited', set())) - new_cells
+    if revisit_count > 0:
+        reward -= 1.0
+
+    # 4. Perimeter tracking bonus (+8 if near fire, strong incentive)
     if fire_dist < 3.0:
-        reward += 5.0 * (1.0 - fire_dist / 3.0)
-
-    # 4. Revisit penalty (-3 for revisiting)
-    # (Light penalty, not enough to override exploration)
+        reward += 8.0 * (1.0 - fire_dist / 3.0)
 
     # 5. Episode completion bonus
     if step >= max_steps - 1:
-        reward += 20.0
+        reward += 5.0
 
     return reward
 
