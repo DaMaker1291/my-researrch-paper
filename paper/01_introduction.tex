@@ -1,0 +1,64 @@
+\section{Introduction}
+
+Autonomous drones operating in hurricane-force winds face a fundamental tension: the need for aggressive control to fight extreme disturbances versus the need for provable safety guarantees. Current approaches resolve this tension by either (a) sacrificing safety for performance~\cite{ppo_hurricane}, or (b) sacrificing performance for safety~\cite{cbf_quadrotor}. Neither approach is acceptable for real-world deployment in life-threatening weather, where both survival and mission completion are critical.
+
+We present \textbf{MARAHS} (\textbf{M}ulti-\textbf{A}gent \textbf{R}obust \textbf{A}utonomous \textbf{H}urricane \textbf{S}warm), the first autonomous drone system that achieves \emph{all} of the following simultaneously:
+
+\begin{enumerate}
+    \item \textbf{Adaptation}: Online learning of wind conditions in $<0.5$ seconds via meta-adaptive neural control (Section~\ref{sec:adaptation}).
+    \item \textbf{Safety}: Provable safety guarantees through Control Barrier Functions that verify adapted controllers in real-time (Section~\ref{sec:safety}).
+    \item \textbf{Robustness}: Guaranteed performance under worst-case adversarial perturbations (Section~\ref{sec:adversarial}).
+    \item \textbf{Intelligence}: Optimal information gathering via mutual information maximization (Section~\ref{sec:information}).
+    \item \textbf{Sensorlessness}: Wind estimation from IMU data alone, requiring no dedicated wind sensors (Section~\ref{sec:wind}).
+    \item \textbf{Scalability}: Multi-agent coordination with inter-agent safety constraints (Section~\ref{sec:multiagent}).
+    \item \textbf{Formality}: Mathematical safety certificates with formal proofs of correctness (Section~\ref{sec:formal}).
+    \item \textbf{Self-Evolution}: Automatic discovery of new safety constraints from near-miss experiences (Section~\ref{sec:ses}).
+\end{enumerate}
+
+\subsection{The Challenge}
+
+Operating drones in hurricane conditions presents unique challenges that existing methods cannot address:
+
+\textbf{Unknown and time-varying wind fields.} Unlike controlled laboratory settings, hurricane winds are spatially heterogeneous, temporally volatile, and contain structures (eyewall, rainbands, debris) that no parametric model fully captures. A drone that works in calm air may fail catastrophically when a 200 km/h gust hits from an unexpected direction.
+
+\textbf{Model uncertainty.} The dynamics of a small quadrotor in extreme turbulence are poorly modeled by standard aerodynamic theory. Motor response times vary with temperature and battery state. Structural flexibility creates unmodeled oscillations. Any controller that assumes perfect model knowledge will fail.
+
+\textbf{Safety under uncertainty.} Standard Control Barrier Functions (CBFs)~\cite{ames2014control} provide safety guarantees for known controllers. But when the controller adapts online---as it must in changing conditions---the original safety certificate may no longer hold. We need to verify safety of the \emph{adapted} controller, not just the original one.
+
+\textbf{Sensor limitations.} Real drones in hurricanes cannot carry expensive anemometers or LIDAR. They must infer wind conditions from the sensors they already have: accelerometers, gyroscopes, and motor controllers.
+
+\subsection{Our Approach}
+
+MARAHS addresses these challenges through a novel integration of eight complementary techniques, each addressing a specific aspect of the problem:
+
+\textbf{Online Gaussian Process Wind Mapping.} We reconstruct the full spatial wind field from sparse IMU measurements using a Matérn 5/2 kernel with a Rankine vortex prior. This enables predictive path planning through wind gradients and identification of hurricane structure (eye, eyewall, rainbands) in real-time (Theorem~\ref{thm:gp_convergence}).
+
+\textbf{Safety-Verified Meta-Adaptation.} When the Neural Fly architecture~\cite{dean2022neural} adapts its readout weights online via Recursive Least Squares, we verify that the adapted controller still satisfies all CBF constraints before execution. This creates a ``safe adaptation cone''---the maximum weight change that preserves safety (Theorem~\ref{thm:adaptation_safety}).
+
+\textbf{IMU-to-Wind Inverse Dynamics.} We solve the inverse dynamics problem to estimate wind forces from accelerometer and motor data alone, eliminating the need for dedicated wind sensors. The estimator achieves $<1\%$ error on simulated wind profiles (Theorem~\ref{thm:wind_estimation}).
+
+\textbf{Adversarial Safety Verification.} We test controller robustness against worst-case perturbations using gradient-based optimization, finding the smallest perturbation that would cause a safety violation. This provides guarantees that hold even under model uncertainty (Theorem~\ref{thm:adversarial_robustness}).
+
+\textbf{Information-Theoretic Coverage Planning.} We maximize mutual information about the wind field rather than mere spatial coverage, achieving near-optimal exploration-exploitation balance (Theorem~\ref{thm:info_optimality}).
+
+\textbf{Multi-Scale Adaptation.} We formalize adaptation at four timescales---motor response (1ms), RLS weights (10ms), GP updates (100ms), and policy fine-tuning (1s)---with provable Lyapunov stability guarantees for the composed system (Theorem~\ref{thm:multiscale_stability}).
+
+\textbf{Formal Safety Certificates.} We generate mathematical proofs of safety via Lyapunov functions and reachable set analysis, providing guarantees that hold for all time, not just during testing (Theorem~\ref{thm:formal_certificate}).
+
+\textbf{Self-Evolving Safety.} Most ambitiously, we enable the system to discover \emph{new} safety constraints from near-miss experiences---learning \emph{what} to be safe about, not just \emph{how} to be safe. This is the first system that evolves its safety knowledge through experience (Theorem~\ref{thm:ses_convergence}).
+
+\subsection{Contributions}
+
+\begin{itemize}
+    \item \textbf{Algorithmic}: Eight novel algorithms for safe autonomous operation in extreme weather, including the first online GP wind mapper, the first safety-verified meta-adaptive controller, and the first self-evolving safety system for robotics.
+    
+    \item \textbf{Theoretical}: Thirteen formal theorems with complete proofs establishing convergence rates, safety guarantees, stability conditions, and optimality bounds.
+    
+    \item \textbf{Empirical}: Comprehensive evaluation across five hurricane profiles (Katrina, Harvey, Irma, Maria, Michael) showing that MARAHS achieves 100% safety rate while maintaining competitive coverage performance.
+    
+    \item \textbf{Practical}: An open-source benchmark suite and reproducible experimental protocol for evaluating autonomous drone systems in extreme weather.
+\end{itemize}
+
+\subsection{Paper Organization}
+
+Section~\ref{sec:related} reviews related work. Section~\ref{sec:preliminaries} presents mathematical preliminaries. Sections~\ref{sec:adaptation}--\ref{sec:ses} describe each of our eight contributions. Section~\ref{sec:theory} provides theoretical analysis. Section~\ref{sec:experiments} presents experimental results. Section~\ref{sec:discussion} discusses limitations and future work. Section~\ref{sec:conclusion} concludes.

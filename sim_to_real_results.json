@@ -1,0 +1,349 @@
+{
+  "scenarios": [
+    {
+      "scenario": "steady",
+      "wind_speed": 3.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.07363703459065155,
+        "mean_error": 0.05584029956751767,
+        "max_error": 0.19752647348284602,
+        "mean_velocity": 0.02843309741877976,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.02484221068226629,
+        "mean_error": 0.018540175252340772,
+        "max_error": 0.06593545039448324,
+        "mean_velocity": 0.014002264554541313,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "steady",
+      "wind_speed": 5.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.12256786452833711,
+        "mean_error": 0.09306440501219317,
+        "max_error": 0.3278137991886014,
+        "mean_velocity": 0.0469871693263707,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.04138152838322732,
+        "mean_error": 0.03089907799924832,
+        "max_error": 0.10973255065690404,
+        "mean_velocity": 0.023271097658667875,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "steady",
+      "wind_speed": 8.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.19752369957697896,
+        "mean_error": 0.15533693662181752,
+        "max_error": 0.5212483097887027,
+        "mean_velocity": 0.0727182565228742,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.06615802755143342,
+        "mean_error": 0.049435618145815464,
+        "max_error": 0.17519417970056325,
+        "mean_velocity": 0.03707732201260695,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "steady",
+      "wind_speed": 10.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.26617702444807706,
+        "mean_error": 0.2321727203432666,
+        "max_error": 0.6489234622673594,
+        "mean_velocity": 0.08814930227542701,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.08265446966995543,
+        "mean_error": 0.06179210645592586,
+        "max_error": 0.21868061308544268,
+        "mean_velocity": 0.046217912390992565,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "steady",
+      "wind_speed": 12.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.3489694070753766,
+        "mean_error": 0.3204197788086025,
+        "max_error": 0.7756064721003161,
+        "mean_velocity": 0.09763216475813043,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.09913426510930297,
+        "mean_error": 0.0741476340395084,
+        "max_error": 0.2620448565268226,
+        "mean_velocity": 0.055308529977531266,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "steady",
+      "wind_speed": 15.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.48624112831725197,
+        "mean_error": 0.4604852868533545,
+        "max_error": 0.9638333206818227,
+        "mean_velocity": 0.1241191005887778,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.12382335009197738,
+        "mean_error": 0.09267913048008672,
+        "max_error": 0.3268649288891338,
+        "mean_velocity": 0.06885270129820538,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "steady",
+      "wind_speed": 20.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 1.152978520594634,
+        "mean_error": 1.0026690048643998,
+        "max_error": 2.1456307724214727,
+        "mean_velocity": 0.289342389176868,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.16498189492997706,
+        "mean_error": 0.12357812805853545,
+        "max_error": 0.4348948773173002,
+        "mean_velocity": 0.09130388587365622,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "steady",
+      "wind_speed": 25.0,
+      "pid": {
+        "survival_rate": 0.9993333333333333,
+        "rmse": 2.854322901052865,
+        "mean_error": 2.7733683478570823,
+        "max_error": 3.007145387058872,
+        "mean_velocity": 0.20004567592754147,
+        "alive_steps": 1499,
+        "total_steps": 1500,
+        "crash_reason": "displacement"
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.2617175733017878,
+        "mean_error": 0.18986784067973705,
+        "max_error": 0.6840905528789464,
+        "mean_velocity": 0.13332219621052271,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "turbulent",
+      "wind_speed": 5.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.12317324557934511,
+        "mean_error": 0.09323937760734047,
+        "max_error": 0.3295137895824535,
+        "mean_velocity": 0.0528955352606744,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.04147865948680468,
+        "mean_error": 0.0319993750882754,
+        "max_error": 0.10989340415950745,
+        "mean_velocity": 0.02330250498245177,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "turbulent",
+      "wind_speed": 10.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.26730235395924984,
+        "mean_error": 0.23239911614183265,
+        "max_error": 0.6521549886428006,
+        "mean_velocity": 0.10285945788539436,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.08285690953511719,
+        "mean_error": 0.06399562768562068,
+        "max_error": 0.21894102820732164,
+        "mean_velocity": 0.04631416850689944,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "turbulent",
+      "wind_speed": 15.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.4882185636966719,
+        "mean_error": 0.46158979141610856,
+        "max_error": 0.9708135347665514,
+        "mean_velocity": 0.15109809057384174,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.12413873819975696,
+        "mean_error": 0.09598860060286468,
+        "max_error": 0.32716431195017487,
+        "mean_velocity": 0.06904750007562357,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "fire_plume",
+      "wind_speed": 5.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.12485316170688252,
+        "mean_error": 0.09431451440662329,
+        "max_error": 0.33807924393790184,
+        "mean_velocity": 0.05474443500608487,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.04214881136217887,
+        "mean_error": 0.0324177896707189,
+        "max_error": 0.11261364872800352,
+        "mean_velocity": 0.0250970549693451,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "fire_plume",
+      "wind_speed": 10.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.2689416578457817,
+        "mean_error": 0.23303808746787535,
+        "max_error": 0.6636625898901097,
+        "mean_velocity": 0.10501235176322359,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.08366242184468874,
+        "mean_error": 0.06433471844275093,
+        "max_error": 0.22266833076050258,
+        "mean_velocity": 0.049347956819292174,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    },
+    {
+      "scenario": "fire_plume",
+      "wind_speed": 15.0,
+      "pid": {
+        "survival_rate": 1.0,
+        "rmse": 0.4902895572814551,
+        "mean_error": 0.4626118969418491,
+        "max_error": 0.9857498524557171,
+        "mean_velocity": 0.15470652517652475,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      },
+      "cbf": {
+        "survival_rate": 1.0,
+        "rmse": 0.12526098154526877,
+        "mean_error": 0.09634588940909952,
+        "max_error": 0.33210110079144656,
+        "mean_velocity": 0.07343577975289418,
+        "alive_steps": 1500,
+        "total_steps": 1500,
+        "crash_reason": ""
+      }
+    }
+  ],
+  "overall": {
+    "pid_avg_survival": 0.9999523809523809,
+    "cbf_avg_survival": 1.0,
+    "safety_improvement": 4.7619047619074095e-05
+  },
+  "figures": [
+    "figures/fig5_sim_to_real.pdf",
+    "figures/fig6_safety_margins.pdf"
+  ]
+}

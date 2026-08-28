@@ -1,0 +1,69 @@
+{
+  "benchmark": {
+    "PPO (no CBF)": {
+      "reward_mean": -24051.4921875,
+      "reward_std": 3354.066650390625,
+      "perimeter_mean": 0.8971767305167972,
+      "perimeter_std": 0.8208666451210657,
+      "safety_mean": 90.5,
+      "cells_mean": 28.2,
+      "alive_steps_mean": 150.0,
+      "cbf_overrides_mean": 0.0
+    },
+    "MARAHS (PPO+CBF)": {
+      "reward_mean": -9859.9716796875,
+      "reward_std": 5735.91943359375,
+      "perimeter_mean": 1.1289338658590575,
+      "perimeter_std": 1.3573864522703147,
+      "safety_mean": 94.0,
+      "cells_mean": 31.65,
+      "alive_steps_mean": 150.0,
+      "cbf_overrides_mean": 53.89988337574215
+    },
+    "PID (no CBF)": {
+      "reward_mean": 1508.84326171875,
+      "reward_std": 2270.895751953125,
+      "perimeter_mean": 6.585709366538002,
+      "perimeter_std": 5.521550077437927,
+      "safety_mean": 31.0,
+      "cells_mean": 29.45,
+      "alive_steps_mean": 132.65,
+      "cbf_overrides_mean": 0.0
+    },
+    "PID+CBF": {
+      "reward_mean": -1434.556396484375,
+      "reward_std": 4459.71435546875,
+      "perimeter_mean": 1.8211811286035933,
+      "perimeter_std": 1.9235545113791954,
+      "safety_mean": 99.5,
+      "cells_mean": 29.0,
+      "alive_steps_mean": 150.0,
+      "cbf_overrides_mean": 14.983185595567866
+    },
+    "Greedy": {
+      "reward_mean": 1939.98828125,
+      "reward_std": 2338.850830078125,
+      "perimeter_mean": 1.8112287158986828,
+      "perimeter_std": 2.2079847699972954,
+      "safety_mean": 58.5,
+      "cells_mean": 60.6,
+      "alive_steps_mean": 146.95,
+      "cbf_overrides_mean": 0.0
+    },
+    "Random": {
+      "reward_mean": 3496.69775390625,
+      "reward_std": 1502.963623046875,
+      "perimeter_mean": 4.2249524139179595,
+      "perimeter_std": 6.597547529824444,
+      "safety_mean": 55.0,
+      "cells_mean": 57.35,
+      "alive_steps_mean": 146.85,
+      "cbf_overrides_mean": 0.0
+    }
+  },
+  "training": {
+    "final_reward": -6366.6982421875,
+    "final_perimeter": 2.689566292709314,
+    "final_safety": 82.7
+  }
+}

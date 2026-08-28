@@ -1,0 +1,69 @@
+{
+  "benchmark": {
+    "PPO (no CBF)": {
+      "reward_mean": -3838.979248046875,
+      "reward_std": 2167.25390625,
+      "perimeter_mean": 1.0481168795286673,
+      "perimeter_std": 0.7830291285085449,
+      "safety_mean": 59.166666666666664,
+      "cells_mean": 18.3,
+      "alive_steps_mean": 140.9,
+      "cbf_overrides_mean": 0.0
+    },
+    "MARAHS (PPO+CBF)": {
+      "reward_mean": -2842.53955078125,
+      "reward_std": 2399.3046875,
+      "perimeter_mean": 0.9682215529678799,
+      "perimeter_std": 1.2163989031852256,
+      "safety_mean": 85.0,
+      "cells_mean": 20.35,
+      "alive_steps_mean": 147.45,
+      "cbf_overrides_mean": 58.954302682368166
+    },
+    "PID (no CBF)": {
+      "reward_mean": 2254.412841796875,
+      "reward_std": 1881.5013427734375,
+      "perimeter_mean": 8.930008115388492,
+      "perimeter_std": 4.076560186830474,
+      "safety_mean": 14.166666666666666,
+      "cells_mean": 20.65,
+      "alive_steps_mean": 110.2,
+      "cbf_overrides_mean": 0.0
+    },
+    "PID+CBF": {
+      "reward_mean": -333.447998046875,
+      "reward_std": 2129.39013671875,
+      "perimeter_mean": 1.1621066888166158,
+      "perimeter_std": 1.567084738355439,
+      "safety_mean": 84.16666666666667,
+      "cells_mean": 20.3,
+      "alive_steps_mean": 146.5,
+      "cbf_overrides_mean": 26.166191240322735
+    },
+    "Greedy": {
+      "reward_mean": 542.2468872070312,
+      "reward_std": 1279.9356689453125,
+      "perimeter_mean": 1.5263111395281186,
+      "perimeter_std": 1.461272879700406,
+      "safety_mean": 24.166666666666664,
+      "cells_mean": 34.75,
+      "alive_steps_mean": 126.85,
+      "cbf_overrides_mean": 0.0
+    },
+    "Random": {
+      "reward_mean": 2701.69970703125,
+      "reward_std": 783.5390625,
+      "perimeter_mean": 7.801543758768494,
+      "perimeter_std": 5.1936946202227885,
+      "safety_mean": 4.166666666666666,
+      "cells_mean": 36.1,
+      "alive_steps_mean": 119.8,
+      "cbf_overrides_mean": 0.0
+    }
+  },
+  "training": {
+    "final_reward": -1079.633544921875,
+    "final_perimeter": 3.13790590251145,
+    "final_safety": 31.08333333333333
+  }
+}
