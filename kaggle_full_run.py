@@ -296,7 +296,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}", flush=True)
 if device.type == "cuda":
     props = torch.cuda.get_device_properties(0)
-    print(f"GPU: {props.name} | {props.total_mem / 1e9:.1f} GB", flush=True)
+    print(f"GPU: {props.name} | {props.total_memory / 1e9:.1f} GB", flush=True)
 
 
 class MultiHeadAttention(nn.Module):
