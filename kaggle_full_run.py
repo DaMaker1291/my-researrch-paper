@@ -464,12 +464,13 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
             pos = np.array([env.drones[i]['pos'] for i in range(n_drones)], dtype=np.float32)
             if not am.any(): break
             actions, log_probs, values, enhanced = agent.select_actions(obs, pos, am)
+            prev_visited = [set(env.drones[i].get('visited', set())) for i in range(n_drones)]
             obs_next, _, dones, infos = env.step(np.array(actions, dtype=np.int32))
             shaped = np.zeros(n_drones, dtype=np.float32)
             for i in range(n_drones):
                 if not am[i]: continue
                 fd = infos[i].get('fire_dist', 10.0)
-                shaped[i] = compute_reward(env.drones[i], set(env.drones[i].get('visited',set())), fd, dones[i], step, max_steps)
+                shaped[i] = compute_reward(env.drones[i], prev_visited[i], fd, dones[i], step, max_steps)
                 ep_r += shaped[i]
                 if dones[i] and not env.drones[i]['alive']: ep_crashes += 1
             agent.store(enhanced, actions, shaped, dones.astype(np.float32), log_probs, values)
@@ -478,8 +479,7 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
         
         loss = agent.update()
         cov = len(env.total_cells_explored) / (grid*grid) * 100
-        alive_count = sum(1 for i in range(n_drones) if env.drones[i]['alive'])
-        saf = (1.0 - ep_crashes / max(1, alive_count)) * 100
+        saf = (1.0 - ep_crashes / n_drones) * 100
         
         rewards_h.append(ep_r); coverage_h.append(cov); safety_h.append(saf)
         
