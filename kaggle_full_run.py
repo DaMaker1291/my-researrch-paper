@@ -362,7 +362,9 @@ class FastGATPPO:
     def __init__(self, obs_dim=656, act_dim=5, gat_hidden=128, gat_out=64, n_heads=4, comm_range=15.0, lr=3e-4):
         self.gat = GATCommunication(obs_dim, gat_hidden, gat_out, n_heads, comm_range)
         self.policy = PPONetwork(obs_dim + gat_out, act_dim)
-        self.optimizer = torch.optim.Adam(list(self.gat.parameters()) + list(self.policy.parameters()), lr=lr, eps=1e-5)
+        params = list(self.gat.parameters()) + list(self.policy.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=lr, eps=1e-5)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=1500, eta_min=1e-5)
         self._traj = []
     def select_actions(self, obs, positions, alive_mask):
         obs_t = torch.tensor(obs, dtype=torch.float32)
@@ -377,7 +379,7 @@ class FastGATPPO:
     def store(self, enhanced_obs, actions, rewards, dones, log_probs, values):
         for i in range(len(actions)):
             self._traj.append({'obs': enhanced_obs[i], 'action': actions[i], 'reward': rewards[i], 'done': dones[i], 'log_prob': log_probs[i], 'value': values[i]})
-    def update(self, gamma=0.99, gae_lambda=0.95, n_epochs=4, batch_size=256, clip_eps=0.2, entropy_coef=0.02):
+    def update(self, gamma=0.99, gae_lambda=0.95, n_epochs=6, batch_size=512, clip_eps=0.2, entropy_coef=0.02):
         if not self._traj: return 0.0
         n = len(self._traj)
         rewards = np.array([t['reward'] for t in self._traj], dtype=np.float32)
@@ -415,6 +417,7 @@ class FastGATPPO:
                 self.optimizer.step()
                 total_loss += loss.item(); count += 1
         self._traj.clear()
+        self.scheduler.step()
         return total_loss / max(1, count)
     def save(self, path):
         torch.save({'gat': self.gat.state_dict(), 'policy': self.policy.state_dict()}, path)
@@ -433,28 +436,23 @@ def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashe
     reward = 0.05
     new_cells = sum(1 for c in drone['visited'] if c not in prev_visited)
     reward += 25.0 * new_cells
+    # Info gain: +10 for observing fire front (high-information region)
+    if new_cells > 0 and 1.0 < fire_dist < 5.0:
+        reward += 10.0
     # Overlap penalty: -3 per alive drone within 3 cells
-    nearby = 0
-    for j, other in enumerate(all_drones):
-        if j != drone_idx and other['alive']:
-            if np.linalg.norm(drone['pos'] - other['pos']) < 3.0:
-                nearby += 1
+    nearby = sum(1 for j, other in enumerate(all_drones) if j != drone_idx and other['alive'] and np.linalg.norm(drone['pos'] - other['pos']) < 3.0)
     reward -= 3.0 * nearby
     # Diversity bonus: reward for occupying under-represented quadrants
     mid = grid_size / 2.0
-    qx, qy = int(drone['pos'][0] >= mid), int(drone['pos'][1] >= mid)
-    q = qx + 2 * qy
-    qcounts = [0]*4
-    for other in all_drones:
-        if other['alive']:
-            qcounts[int(other['pos'][0] >= mid) + 2*int(other['pos'][1] >= mid)] += 1
+    q = int(drone['pos'][0] >= mid) + 2*int(drone['pos'][1] >= mid)
+    qcounts = [sum(1 for other in all_drones if other['alive'] and int(other['pos'][0] >= mid) + 2*int(other['pos'][1] >= mid) == k) for k in range(4)]
     reward += 2.0 / max(1, qcounts[q])
     # Fire proximity (reduced from 8.0 to 2.0)
     if fire_dist < 3.0: reward += 2.0 * (1.0 - fire_dist / 3.0)
     if step >= max_steps - 1: reward += 5.0
     return reward
 
-def train(n_episodes=1500, grid=30, n_drones=10, max_steps=300):
+def train(n_episodes=1500, grid=20, n_drones=8, max_steps=200):
     print("="*60)
     print(f"GAT-MARAHS Training | {n_episodes} eps | {n_drones} drones | {grid}x{grid}")
     print("="*60)
@@ -463,6 +461,7 @@ def train(n_episodes=1500, grid=30, n_drones=10, max_steps=300):
     agent = FastGATPPO(obs_dim=env.obs_dim, act_dim=env.act_dim)
     
     stages = [(0,250),(5,500),(10,750),(15,1000),(20,1250),(25,1500)]
+    val_rewards, val_coverages, val_safeties = [], [], []
     rewards_h, coverage_h, safety_h = [], [], []
     best_r = -float('inf')
     early_stop_patience = 500  # stop if coverage >= 85% for this many consecutive episodes
@@ -509,7 +508,26 @@ def train(n_episodes=1500, grid=30, n_drones=10, max_steps=300):
             elapsed = time.time() - t0
             print(f"Ep {ep+1:5d}/{n_episodes} | R: {avg_r:7.1f} | Cov: {avg_cov:5.1f}% | Safe: {avg_saf:4.0f}% | wind={wind} | {elapsed:.0f}s")
             if avg_r > best_r: best_r = avg_r; agent.save('gat_marahs_best.pt')
-            agent.save(f'gat_checkpoint_ep{ep+1}.pt')  # auto-save every 100 eps for timeout resilience
+            agent.save(f'gat_checkpoint_ep{ep+1}.pt')
+            # Held-out validation
+            val_c, val_s, val_r = [], [], []
+            for _ in range(5):
+                ve = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=wind)
+                vo = ve.reset()
+                vr, vc = 0.0, 0
+                for _ in range(max_steps):
+                    va = np.array([ve.drones[i]['alive'] for i in range(n_drones)])
+                    vp = np.array([ve.drones[i]['pos'] for i in range(n_drones)], dtype=np.float32)
+                    if not va.any(): break
+                    vacts, _, _, _ = agent.select_actions(vo, vp, va)
+                    vo, _, vd, vi = ve.step(np.array(vacts, dtype=np.int32))
+                    for i2 in range(n_drones):
+                        if va[i2] and vd[i2] and not ve.drones[i2]['alive']: vc += 1
+                    if all(vd): break
+                vr = len(ve.total_cells_explored)/(grid*grid)*100
+                val_c.append(vr); val_s.append((1.0-vc/n_drones)*100)
+            val_coverages.append(np.mean(val_c)); val_safeties.append(np.mean(val_s))
+            print(f"         VAL | Cov: {np.mean(val_c):5.1f}% | Safe: {np.mean(val_s):4.0f}%")
             if avg_cov >= early_stop_target:
                 early_stop_counter += 100
             else:
@@ -696,9 +714,9 @@ if __name__ == "__main__":
     print("PlumeGym-MARL: Full Kaggle Training Pipeline")
     print("="*60)
     
-    GRID = 30
-    N_DRONES = 10
-    MAX_STEPS = 300
+    GRID = 20
+    N_DRONES = 8
+    MAX_STEPS = 200
     N_EPISODES = 1500
     
     # Step 1: Train
