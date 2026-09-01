@@ -170,6 +170,9 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
     coverage_history = []
     safety_history = []
     best_r = -float('inf')
+    early_stop_patience = 500  # stop if coverage >= 85% for this many consecutive episodes
+    early_stop_counter = 0
+    early_stop_target = 85.0
     
     t0 = time.time()
     
@@ -196,6 +199,7 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
                 break
             
             actions, log_probs, values, enhanced = agent.select_actions(obs, positions, alive_mask)
+            prev_visited = [set(env.drones[i].get('visited', set())) for i in range(n_drones)]
             obs_next, rewards_env, dones, infos = env.step(np.array(actions, dtype=np.int32))
             
             # Compute shaped rewards
@@ -204,7 +208,7 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
                 if not alive_mask[i]:
                     continue
                 d = env.drones[i]
-                prev_v = set(d.get('visited', set()))
+                prev_v = prev_visited[i]
                 fd = infos[i].get('fire_dist', 10.0)
                 shaped_rewards[i] = compute_reward(d, prev_v, fd, dones[i], step, max_steps)
                 ep_r += shaped_rewards[i]
@@ -222,7 +226,7 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
         loss = agent.update()
         
         cov = len(env.total_cells_explored) / (grid * grid) * 100
-        saf = (1.0 - ep_crashes / max(1, sum(alive_mask))) * 100
+        saf = (1.0 - ep_crashes / n_drones) * 100
         
         rewards_history.append(ep_r)
         coverage_history.append(cov)
@@ -241,6 +245,13 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
             if avg_r > best_r:
                 best_r = avg_r
                 agent.save('gat_marahs_best.pt')
+            if avg_cov >= early_stop_target:
+                early_stop_counter += 100
+            else:
+                early_stop_counter = 0
+            if early_stop_counter >= early_stop_patience:
+                print(f"Early stop at ep {ep+1}: coverage {avg_cov:.1f}% >= {early_stop_target}% for {early_stop_patience} consecutive episodes")
+                break
         
         if (ep + 1) % 500 == 0:
             agent.save(f'gat_marahs_ep{ep+1}.pt')

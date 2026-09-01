@@ -448,6 +448,9 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
     stages = [(0,500),(5,1000),(10,1500),(15,2000),(20,2500),(25,3000)]
     rewards_h, coverage_h, safety_h = [], [], []
     best_r = -float('inf')
+    early_stop_patience = 500  # stop if coverage >= 85% for this many consecutive episodes
+    early_stop_counter = 0
+    early_stop_target = 85.0
     t0 = time.time()
     
     for ep in range(n_episodes):
@@ -488,6 +491,13 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
             elapsed = time.time() - t0
             print(f"Ep {ep+1:5d}/{n_episodes} | R: {avg_r:7.1f} | Cov: {avg_cov:5.1f}% | Safe: {avg_saf:4.0f}% | wind={wind} | {elapsed:.0f}s")
             if avg_r > best_r: best_r = avg_r; agent.save('gat_marahs_best.pt')
+            if avg_cov >= early_stop_target:
+                early_stop_counter += 100
+            else:
+                early_stop_counter = 0
+            if early_stop_counter >= early_stop_patience:
+                print(f"Early stop at ep {ep+1}: coverage {avg_cov:.1f}% >= {early_stop_target}% for {early_stop_patience} consecutive episodes")
+                break
         if (ep+1) % 500 == 0: agent.save(f'gat_ep{ep+1}.pt')
     
     agent.save('gat_marahs_final.pt')
