@@ -454,7 +454,7 @@ def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashe
     if step >= max_steps - 1: reward += 5.0
     return reward
 
-def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
+def train(n_episodes=1500, grid=30, n_drones=10, max_steps=300):
     print("="*60)
     print(f"GAT-MARAHS Training | {n_episodes} eps | {n_drones} drones | {grid}x{grid}")
     print("="*60)
@@ -462,7 +462,7 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
     env = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
     agent = FastGATPPO(obs_dim=env.obs_dim, act_dim=env.act_dim)
     
-    stages = [(0,500),(5,1000),(10,1500),(15,2000),(20,2500),(25,3000)]
+    stages = [(0,250),(5,500),(10,750),(15,1000),(20,1250),(25,1500)]
     rewards_h, coverage_h, safety_h = [], [], []
     best_r = -float('inf')
     early_stop_patience = 500  # stop if coverage >= 85% for this many consecutive episodes
@@ -470,7 +470,8 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
     early_stop_target = 85.0
     t0 = time.time()
     
-    for ep in range(n_episodes):
+    try:
+      for ep in range(n_episodes):
         wind = 0
         for w, end in stages:
             if ep < end: wind = w; break
@@ -508,6 +509,7 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
             elapsed = time.time() - t0
             print(f"Ep {ep+1:5d}/{n_episodes} | R: {avg_r:7.1f} | Cov: {avg_cov:5.1f}% | Safe: {avg_saf:4.0f}% | wind={wind} | {elapsed:.0f}s")
             if avg_r > best_r: best_r = avg_r; agent.save('gat_marahs_best.pt')
+            agent.save(f'gat_checkpoint_ep{ep+1}.pt')  # auto-save every 100 eps for timeout resilience
             if avg_cov >= early_stop_target:
                 early_stop_counter += 100
             else:
@@ -515,7 +517,8 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
             if early_stop_counter >= early_stop_patience:
                 print(f"Early stop at ep {ep+1}: coverage {avg_cov:.1f}% >= {early_stop_target}% for {early_stop_patience} consecutive episodes")
                 break
-        if (ep+1) % 500 == 0: agent.save(f'gat_ep{ep+1}.pt')
+    except (KeyboardInterrupt, SystemExit, Exception) as e:
+      print(f"\nTraining interrupted at ep {ep+1}: {e}")
     
     agent.save('gat_marahs_final.pt')
     results = {'n_episodes': n_episodes, 'final_reward': float(np.mean(rewards_h[-100:])), 'final_coverage': float(np.mean(coverage_h[-100:])), 'final_safety': float(np.mean(safety_h[-100:])), 'rewards': [float(x) for x in rewards_h], 'coverages': [float(x) for x in coverage_h], 'safety': [float(x) for x in safety_h]}
@@ -696,7 +699,7 @@ if __name__ == "__main__":
     GRID = 30
     N_DRONES = 10
     MAX_STEPS = 300
-    N_EPISODES = 3000
+    N_EPISODES = 1500
     
     # Step 1: Train
     agent, train_res = train(N_EPISODES, GRID, N_DRONES, MAX_STEPS)
