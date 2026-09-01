@@ -6,8 +6,8 @@ PlumeGym-MARL: Full Training Pipeline for Kaggle (GPU-Accelerated)
 Upload this file to Kaggle as a Notebook. Set GPU runtime.
 
 Pipeline:
-  1. Train GAT-MARAHS (30×30, 10 drones, 300 steps) × 3 seeds
-  2. Train No-GAT ablation × 3 seeds (isolates GAT contribution)
+  1. Train GAT-MARAHS (30×30, 10 drones, 300 steps) × 2 seeds
+  2. Train No-GAT ablation × 2 seeds (isolates GAT contribution)
   3. Benchmark vs Random / Greedy / PID baselines
   4. Wind sweep (5/10/15/20/25 m/s) with error bars
   5. Generate publication figures with confidence intervals
@@ -489,7 +489,7 @@ def train(n_episodes=2000, grid=30, n_drones=10, max_steps=300, use_gat=True, se
 
     rewards_h, coverage_h, safety_h = [], [], []
     best_r = -float('inf')
-    early_stop_patience = 500
+    early_stop_patience = 200
     early_stop_counter = 0
     early_stop_target = 85.0
     t0 = time.time()
@@ -536,9 +536,9 @@ def train(n_episodes=2000, grid=30, n_drones=10, max_steps=300, use_gat=True, se
                 best_r = avg_r
                 agent.save(f'{run_id}_best.pt')
             agent.save(f'{run_id}_checkpoint_ep{ep+1}.pt')
-            # Held-out validation
+            # Held-out validation (3 episodes for speed)
             val_c, val_s = [], []
-            for _ in range(5):
+            for _ in range(3):
                 ve = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
                 vo = ve.reset()
                 vc_count = 0
@@ -836,20 +836,20 @@ if __name__ == "__main__":
     GRID = 30
     N_DRONES = 10
     MAX_STEPS = 300
-    N_EPISODES = 2000
-    SEEDS = [42, 123, 777]
+    N_EPISODES = 500
+    SEEDS = [42, 123]
 
     t_total = time.time()
 
-    # Step 1: Train GAT-MARAHS × 3 seeds
+    # Step 1: Train GAT-MARAHS × 2 seeds
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 1: Train GAT-MARAHS (3 seeds)", flush=True)
+    print("# PHASE 1: Train GAT-MARAHS (2 seeds)", flush=True)
     print("#"*60, flush=True)
     gat_agent, gat_all_res = train_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, use_gat=True, seeds=SEEDS)
 
-    # Step 2: Train No-GAT ablation × 3 seeds
+    # Step 2: Train No-GAT ablation × 2 seeds
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 2: Train No-GAT ablation (3 seeds)", flush=True)
+    print("# PHASE 2: Train No-GAT ablation (2 seeds)", flush=True)
     print("#"*60, flush=True)
     nogat_agent, nogat_all_res = train_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, use_gat=False, seeds=SEEDS)
 
@@ -857,13 +857,13 @@ if __name__ == "__main__":
     print("\n" + "#"*60, flush=True)
     print("# PHASE 3: Benchmark vs baselines", flush=True)
     print("#"*60, flush=True)
-    bench_res = benchmark(gat_agent, GRID, N_DRONES, MAX_STEPS, wind=12.0, n_eps=20)
+    bench_res = benchmark(gat_agent, GRID, N_DRONES, MAX_STEPS, wind=12.0, n_eps=10)
 
     # Step 4: Wind sweep
     print("\n" + "#"*60, flush=True)
     print("# PHASE 4: Wind robustness sweep", flush=True)
     print("#"*60, flush=True)
-    wind_res = wind_sweep(gat_agent, GRID, N_DRONES, MAX_STEPS, n_eps=15)
+    wind_res = wind_sweep(gat_agent, GRID, N_DRONES, MAX_STEPS, n_eps=10)
 
     # Step 5: Figures
     print("\n" + "#"*60, flush=True)
