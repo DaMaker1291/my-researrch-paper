@@ -428,12 +428,29 @@ class FastGATPPO:
 # SECTION 3: TRAINING
 # ═══════════════════════════════════════════════════════════════
 
-def compute_reward(drone, prev_visited, fire_dist, crashed, step, max_steps):
+def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashed, step, max_steps, grid_size):
     if crashed: return -15.0
     reward = 0.05
     new_cells = sum(1 for c in drone['visited'] if c not in prev_visited)
     reward += 25.0 * new_cells
-    if fire_dist < 3.0: reward += 8.0 * (1.0 - fire_dist / 3.0)
+    # Overlap penalty: -3 per alive drone within 3 cells
+    nearby = 0
+    for j, other in enumerate(all_drones):
+        if j != drone_idx and other['alive']:
+            if np.linalg.norm(drone['pos'] - other['pos']) < 3.0:
+                nearby += 1
+    reward -= 3.0 * nearby
+    # Diversity bonus: reward for occupying under-represented quadrants
+    mid = grid_size / 2.0
+    qx, qy = int(drone['pos'][0] >= mid), int(drone['pos'][1] >= mid)
+    q = qx + 2 * qy
+    qcounts = [0]*4
+    for other in all_drones:
+        if other['alive']:
+            qcounts[int(other['pos'][0] >= mid) + 2*int(other['pos'][1] >= mid)] += 1
+    reward += 2.0 / max(1, qcounts[q])
+    # Fire proximity (reduced from 8.0 to 2.0)
+    if fire_dist < 3.0: reward += 2.0 * (1.0 - fire_dist / 3.0)
     if step >= max_steps - 1: reward += 5.0
     return reward
 
@@ -473,7 +490,7 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
             for i in range(n_drones):
                 if not am[i]: continue
                 fd = infos[i].get('fire_dist', 10.0)
-                shaped[i] = compute_reward(env.drones[i], prev_visited[i], fd, dones[i], step, max_steps)
+                shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, dones[i], step, max_steps, grid)
                 ep_r += shaped[i]
                 if dones[i] and not env.drones[i]['alive']: ep_crashes += 1
             agent.store(enhanced, actions, shaped, dones.astype(np.float32), log_probs, values)
