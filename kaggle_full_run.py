@@ -4,10 +4,13 @@
 PlumeGym-MARL: Full Training Pipeline for Kaggle
 =================================================================
 Upload this file to Kaggle as a Notebook. Set CPU runtime.
-It will train GAT-MARAHS for 1500 episodes, run benchmarks,
+It will train GAT-MARAHS for 1500 episodes at wind=0, run benchmarks,
 generate publication figures, and save everything.
 
-Runtime: ~2-2.5 hours on Kaggle CPU (1500 eps × ~5s/ep)
+Training: wind=0 only for stable convergence (1500 eps × ~5s = ~2hrs)
+Benchmark: tests at wind=12 against Random/Greedy/PID baselines
+Wind sweep: evaluates at wind 5/10/15/20/25 for robustness analysis
+
 Memory: ~2GB (well within 16GB limit)
 Kaggle limits: 9hr hard cap (GPU) / 12hr (CPU), ~40min idle timeout
 Checkpointing every 100 eps ensures progress survives timeouts.
@@ -463,7 +466,8 @@ def train(n_episodes=1500, grid=20, n_drones=8, max_steps=200):
     env = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
     agent = FastGATPPO(obs_dim=env.obs_dim, act_dim=env.act_dim)
     
-    stages = [(0,250),(5,500),(10,750),(15,1000),(20,1250),(25,1500)]
+    # Wind curriculum removed — train at wind=0 only for stable convergence.
+    # Wind robustness is tested in the benchmark & wind sweep sections.
     val_rewards, val_coverages, val_safeties = [], [], []
     rewards_h, coverage_h, safety_h = [], [], []
     best_r = -float('inf')
@@ -475,8 +479,6 @@ def train(n_episodes=1500, grid=20, n_drones=8, max_steps=200):
     try:
       for ep in range(n_episodes):
         wind = 0
-        for w, end in stages:
-            if ep < end: wind = w; break
         env.base_wind = wind
         obs = env.reset()
         agent._traj.clear()
