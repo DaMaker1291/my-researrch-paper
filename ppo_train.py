@@ -332,44 +332,36 @@ class WindCurriculum:
 # ═══════════════════════════════════════════════════════════════
 
 def compute_reward(drone, prev_visited, total_explored, fire_dist,
-                   thermal_val, wind_spd, alive, crashed, step, max_steps):
+                   thermal_val, wind_spd, alive, crashed, step, max_steps,
+                   grid_size=30):
     """
     Compute shaped reward for one drone at one step.
-    
-    Reward structure (exploration-dominant):
-      +25 per NEW cell explored (primary driver)
-      +0.05 per step alive (tiny survival nudge)
-      +8  for being near fire perimeter (tracking bonus)
-      -1  for revisiting already-explored cells
-      -15 for crashing
+
+    Reward structure (survival-first, consistent with kaggle_full_run.py):
+      1. Staying alive (+1.0/step, +30 at episode end) — dominant signal
+      2. Exploring new cells (+8/cell) — worth pursuing, not worth dying for
+      3. Fire-front observation (+5 when close) — mild tracking nudge
+      4. Coordination penalties — avoid clustering (capped)
     """
     if crashed:
-        return -15.0
+        return -40.0
 
     reward = 0.0
 
-    # 1. Survival bonus (tiny - just enough to prefer alive over dead)
-    reward += 0.05
+    # 1. Per-step survival reward (dominant: ~300 over a full episode)
+    reward += 1.0
 
-    # 2. Exploration bonus (DOMINANT: +25 per new cell)
-    new_cells = 0
-    for cell in drone['visited']:
-        if cell not in prev_visited:
-            new_cells += 1
-    reward += 25.0 * new_cells
+    # 2. Exploration: +8 per NEW cell the team hasn't visited
+    new_cells = sum(1 for c in drone['visited'] if c not in prev_visited)
+    reward += 8.0 * new_cells
 
-    # 3. Revisit penalty (mild discouragement)
-    revisit_count = len(drone.get('visited', set())) - new_cells
-    if revisit_count > 0:
-        reward -= 1.0
+    # 3. Fire front bonus: +5 for being near fire (mild tracking nudge)
+    if 0.5 < fire_dist < 4.0:
+        reward += 5.0 * (1.0 - fire_dist / 4.0)
 
-    # 4. Perimeter tracking bonus (+8 if near fire, strong incentive)
-    if fire_dist < 3.0:
-        reward += 8.0 * (1.0 - fire_dist / 3.0)
-
-    # 5. Episode completion bonus
+    # 4. Episode completion bonus (large: rewards patience)
     if step >= max_steps - 1:
-        reward += 5.0
+        reward += 30.0
 
     return reward
 
@@ -476,11 +468,13 @@ def train_ppo(n_episodes=3000, grid_size=30, n_drones=10, max_steps=300,
                 fire_dist = infos[drone_id].get('fire_dist', 10.0)
                 thermal = infos[drone_id].get('thermal', 0.0)
                 wind_spd = infos[drone_id].get('wind_speed', 0.0)
+                # FIX: use infos crash flag, NOT dones[] (which includes episode-end)
+                crashed = infos[drone_id].get('crashed', False)
 
                 reward = compute_reward(
                     d, prev_visited, env.total_cells_explored,
                     fire_dist, thermal, wind_spd,
-                    d['alive'], dones[drone_id], step, max_steps
+                    d['alive'], crashed, step, max_steps
                 )
 
                 # Update stored reward and done
@@ -489,7 +483,7 @@ def train_ppo(n_episodes=3000, grid_size=30, n_drones=10, max_steps=300,
                 t['done'][-1] = dones[drone_id]
 
                 ep_reward += reward
-                if dones[drone_id] and not d['alive']:
+                if crashed:
                     ep_crashes += 1
 
             obs = next_obs

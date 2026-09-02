@@ -41,7 +41,7 @@ else:
 # ═══════════════════════════════════════════════════════════════
 
 class WildfireEnv:
-    def __init__(self, grid=30, n_drones=10, max_steps=150, wind_speed=0.0, obs_r=4):
+    def __init__(self, grid=30, n_drones=10, max_steps=300, wind_speed=0.0, obs_r=4):
         self.grid = grid
         self.n_drones = n_drones
         self.max_steps = max_steps
@@ -389,28 +389,43 @@ class FastGATPPO:
             actions = dist.sample()
         return actions.cpu().numpy(), dist.log_prob(actions).cpu().numpy(), values.cpu().numpy(), enhanced.detach()
 
-    def store(self, enhanced_obs, actions, rewards, dones, log_probs, values):
+    def store(self, enhanced_obs, actions, rewards, dones, log_probs, values, agent_ids=None):
         for i in range(len(actions)):
             self._traj.append({
                 'obs': enhanced_obs[i].cpu(), 'action': actions[i],
                 'reward': rewards[i], 'done': dones[i],
-                'log_prob': log_probs[i], 'value': values[i]})
+                'log_prob': log_probs[i], 'value': values[i],
+                'agent_id': agent_ids[i] if agent_ids is not None else 0})
 
     def update(self, gamma=0.99, gae_lambda=0.95, n_epochs=6, batch_size=512, clip_eps=0.2, entropy_coef=0.02):
         if not self._traj: return 0.0
         n = len(self._traj)
-        rewards = np.array([t['reward'] for t in self._traj], dtype=np.float32)
-        values = np.array([t['value'] for t in self._traj], dtype=np.float32)
-        dones = np.array([t['done'] for t in self._traj], dtype=np.float32)
-        advantages, returns = np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32)
-        gae = 0.0
-        for step in reversed(range(n)):
-            next_val = 0.0 if step == n-1 else values[step+1]
-            next_done = 1.0 if step == n-1 else dones[step+1]
-            delta = rewards[step] + gamma * next_val * (1-next_done) - values[step]
-            gae = delta + gamma * gae_lambda * (1-next_done) * gae
-            advantages[step] = gae
-            returns[step] = gae + values[step]
+
+        # Per-drone GAE: transitions are interleaved across agents,
+        # so we must compute GAE within each agent's sequence separately
+        # to avoid mixing different agents' value estimates.
+        advantages = np.zeros(n, dtype=np.float32)
+        returns = np.zeros(n, dtype=np.float32)
+
+        # Group trajectory indices by agent_id, preserving insertion order
+        agent_groups = {}
+        for i, t in enumerate(self._traj):
+            aid = t.get('agent_id', 0)
+            if aid not in agent_groups:
+                agent_groups[aid] = []
+            agent_groups[aid].append(i)
+
+        for aid, indices in agent_groups.items():
+            gae = 0.0
+            for k in reversed(range(len(indices))):
+                idx = indices[k]
+                next_idx = indices[k+1] if k+1 < len(indices) else None
+                next_val = 0.0 if next_idx is None else self._traj[next_idx]['value']
+                next_done = 1.0 if next_idx is None else self._traj[next_idx]['done']
+                delta = self._traj[idx]['reward'] + gamma * next_val * (1-next_done) - self._traj[idx]['value']
+                gae = delta + gamma * gae_lambda * (1-next_done) * gae
+                advantages[idx] = gae
+                returns[idx] = gae + self._traj[idx]['value']
 
         all_obs = torch.stack([t['obs'].squeeze(0) for t in self._traj]).to(device)
         all_actions = torch.tensor([t['action'] for t in self._traj], dtype=torch.long).to(device)
@@ -453,37 +468,51 @@ class FastGATPPO:
 # ═══════════════════════════════════════════════════════════════
 
 def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashed, step, max_steps, grid_size):
-    """Information-theoretic reward for multi-agent wildfire tracking."""
-    if crashed: return -10.0
+    """Balanced reward: survival-first exploration for multi-agent wildfire tracking.
 
-    reward = 0.05  # survival per step
+    Incentive hierarchy:
+      1. Staying alive (+1.0/step, +30 at episode end) — dominant signal
+      2. Exploring new cells (+8/cell) — worth pursuing, not worth dying for
+      3. Fire-front observation (+5 when close) — mild tracking nudge
+      4. Coordination penalties — avoid clustering
+    """
+    if crashed: return -40.0  # strong penalty: crashing is always bad
 
-    # 1. Exploration: +50 per NEW cell the team hasn't visited
+    reward = 0.0
+
+    # 1. Per-step survival reward (dominant: ~300 over a full episode)
+    reward += 1.0
+
+    # 2. Exploration: +8 per NEW cell the team hasn't visited
+    #    At ~15 new cells/episode this adds ~120 — meaningful but
+    #    less than the 300 from surviving the whole episode.
     new_cells = sum(1 for c in drone['visited'] if c not in prev_visited)
-    reward += 50.0 * new_cells
+    reward += 8.0 * new_cells
 
-    # 2. Fire front bonus: +20 for being near fire (high info)
+    # 3. Fire front bonus: +5 for being near fire (mild tracking nudge)
     if 0.5 < fire_dist < 4.0:
-        reward += 20.0 * (1.0 - fire_dist / 4.0)
+        reward += 5.0 * (1.0 - fire_dist / 4.0)
 
-    # 3. Overlap penalty: -8 per drone within range 3
+    # 4. Overlap penalty: -1.0 per drone within range 2, capped at -3.0
+    #    Caps prevent the penalty from overwhelming survival reward (+1/step)
+    #    when many drones cluster together.
     nearby = 0
     for j, other in enumerate(all_drones):
         if j != drone_idx and other['alive']:
-            if np.linalg.norm(drone['pos'] - other['pos']) < 3.0:
+            if np.linalg.norm(drone['pos'] - other['pos']) < 2.0:
                 nearby += 1
-    reward -= 8.0 * nearby
+    reward -= min(3.0, 1.0 * nearby)
 
-    # 4. Quadrant diversity: +3 / count in same quadrant
+    # 5. Quadrant diversity: +2 / count in same quadrant
     mid = grid_size / 2.0
     q = int(drone['pos'][0] >= mid) + 2 * int(drone['pos'][1] >= mid)
     qcount = sum(1 for o in all_drones if o['alive'] and
                  int(o['pos'][0] >= mid) + 2*int(o['pos'][1] >= mid) == q)
-    reward += 3.0 / max(1, qcount)
+    reward += 2.0 / max(1, qcount)
 
-    # 5. Survival bonus at end
+    # 6. Episode completion bonus (large: rewards patience)
     if step >= max_steps - 1:
-        reward += 5.0
+        reward += 30.0
 
     return reward
 
@@ -492,7 +521,7 @@ def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashe
 # SECTION 4: TRAINING
 # ═══════════════════════════════════════════════════════════════
 
-def train(n_episodes=800, grid=30, n_drones=10, max_steps=150, use_gat=True, seed=0, run_id="gat"):
+def train(n_episodes=800, grid=30, n_drones=10, max_steps=300, use_gat=True, seed=0, run_id="gat"):
     torch.manual_seed(seed); np.random.seed(seed)
     tag = "GAT-MARAHS" if use_gat else "No-GAT (Ablation)"
     print(f"\n{'='*60}", flush=True)
@@ -506,6 +535,9 @@ def train(n_episodes=800, grid=30, n_drones=10, max_steps=150, use_gat=True, see
     rewards_h, coverage_h, safety_h = [], [], []
     best_r = -float('inf')
     early_stop_counter = 0
+    # Require sustained high coverage (≥65%) for 300 consecutive 100-ep windows
+    early_stop_target = 65.0
+    early_stop_patience = 300
     t0 = time.time()
 
     try:
@@ -526,10 +558,12 @@ def train(n_episodes=800, grid=30, n_drones=10, max_steps=150, use_gat=True, see
                 for i in range(n_drones):
                     if not am[i]: continue
                     fd = infos[i].get('fire_dist', 10.0)
-                    shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, dones[i], step, max_steps, grid)
+                    crashed = infos[i].get('crashed', False)
+                    shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, crashed, step, max_steps, grid)
                     ep_r += shaped[i]
-                    if dones[i] and not env.drones[i]['alive']: ep_crashes += 1
-                agent.store(enhanced, actions, shaped, dones.astype(np.float32), log_probs, values)
+                    if crashed: ep_crashes += 1
+                agent_ids = list(range(n_drones))
+                agent.store(enhanced, actions, shaped, dones.astype(np.float32), log_probs, values, agent_ids)
                 obs = obs_next
                 if all(dones): break
 
@@ -565,13 +599,13 @@ def train(n_episodes=800, grid=30, n_drones=10, max_steps=150, use_gat=True, see
                     val_c.append(len(ve.total_cells_explored)/(grid*grid)*100)
                     val_s.append((1.0-vc/n_drones)*100)
                 print(f"         VAL | Cov: {np.mean(val_c):5.1f}% ± {np.std(val_c):4.1f} | Safe: {np.mean(val_s):4.0f}%", flush=True)
-                # Early stopping
-                if avg_cov >= 70.0:
+                # Early stopping: sustained high coverage
+                if avg_cov >= early_stop_target:
                     early_stop_counter += 100
                 else:
                     early_stop_counter = 0
-                if early_stop_counter >= 400:
-                    print(f"Early stop at ep {ep+1}: coverage {avg_cov:.1f}% >= 70% for 400 episodes", flush=True)
+                if early_stop_counter >= early_stop_patience:
+                    print(f"Early stop at ep {ep+1}: coverage {avg_cov:.1f}% >= {early_stop_target}% for {early_stop_patience} episodes", flush=True)
                     break
     except (KeyboardInterrupt, SystemExit, Exception) as e:
         print(f"\nTraining interrupted at ep {ep+1}: {e}", flush=True)
@@ -630,7 +664,7 @@ def train_multi_seed(n_episodes, grid, n_drones, max_steps, use_gat=True, seeds=
 # SECTION 5: MAPPO BASELINE
 # ═══════════════════════════════════════════════════════════════
 
-def train_mappo(n_episodes=800, grid=30, n_drones=10, max_steps=150, seed=0):
+def train_mappo(n_episodes=800, grid=30, n_drones=10, max_steps=300, seed=0):
     torch.manual_seed(seed); np.random.seed(seed)
     print(f"\n{'='*60}", flush=True)
     print(f"MAPPO | seed={seed} | {n_episodes} eps | {n_drones} drones | {grid}x{grid}", flush=True)
@@ -677,31 +711,41 @@ def train_mappo(n_episodes=800, grid=30, n_drones=10, max_steps=150, seed=0):
                 for i in range(n_drones):
                     if not am[i]: continue
                     fd = infos[i].get('fire_dist', 10.0)
-                    shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, dones[i], step, max_steps, grid)
+                    crashed = infos[i].get('crashed', False)
+                    shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, crashed, step, max_steps, grid)
                     ep_r += shaped[i]
-                    if dones[i] and not env.drones[i]['alive']: ep_crashes += 1
+                    if crashed: ep_crashes += 1
                 for i in range(n_drones):
                     if am[i]:
                         traj.append({'obs': torch.tensor(obs[i]), 'action': actions[i],
                                      'reward': shaped[i], 'done': float(dones[i]),
-                                     'log_prob': lp_list[i], 'value': central_val})
+                                     'log_prob': lp_list[i], 'value': central_val,
+                                     'agent_id': i})
                 obs = obs_next
                 if all(dones): break
 
             # PPO update
             if traj:
                 n = len(traj)
-                rews = np.array([t['reward'] for t in traj], dtype=np.float32)
-                vals = np.array([t['value'] for t in traj], dtype=np.float32)
-                darr = np.array([t['done'] for t in traj], dtype=np.float32)
-                advs, rets = np.zeros(n), np.zeros(n)
-                gae = 0.0
-                for s in reversed(range(n)):
-                    nv = 0.0 if s==n-1 else vals[s+1]
-                    nd = 1.0 if s==n-1 else darr[s+1]
-                    delta = rews[s] + 0.99*nv*(1-nd) - vals[s]
-                    gae = delta + 0.99*0.95*(1-nd)*gae
-                    advs[s] = gae; rets[s] = gae + vals[s]
+                # Per-drone GAE: compute advantages within each agent's sequence
+                advs = np.zeros(n, dtype=np.float32)
+                rets = np.zeros(n, dtype=np.float32)
+                agent_groups = {}
+                for i, t in enumerate(traj):
+                    aid = t.get('agent_id', 0)
+                    if aid not in agent_groups:
+                        agent_groups[aid] = []
+                    agent_groups[aid].append(i)
+                for aid, indices in agent_groups.items():
+                    gae = 0.0
+                    for k in reversed(range(len(indices))):
+                        idx = indices[k]
+                        next_idx = indices[k+1] if k+1 < len(indices) else None
+                        nv = 0.0 if next_idx is None else traj[next_idx]['value']
+                        nd = 1.0 if next_idx is None else traj[next_idx]['done']
+                        delta = traj[idx]['reward'] + 0.99*nv*(1-nd) - traj[idx]['value']
+                        gae = delta + 0.99*0.95*(1-nd)*gae
+                        advs[idx] = gae; rets[idx] = gae + traj[idx]['value']
                 ao = torch.stack([t['obs'] for t in traj]).to(device)
                 aa = torch.tensor([t['action'] for t in traj], dtype=torch.long).to(device)
                 aolp = torch.tensor([t['log_prob'] for t in traj], dtype=torch.float32).to(device)
@@ -734,6 +778,27 @@ def train_mappo(n_episodes=800, grid=30, n_drones=10, max_steps=150, seed=0):
                 if avg_r > best_r:
                     best_r = avg_r
                     torch.save({'policy': policy_net.state_dict(), 'critic': critic.state_dict()}, f'mappo_s{seed}_best.pt')
+                # Validation (3 held-out episodes at wind=0)
+                val_c, val_s = [], []
+                for _ in range(3):
+                    ve = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+                    vo = ve.reset(); vc = 0
+                    for _ in range(max_steps):
+                        va = np.array([ve.drones[i]['alive'] for i in range(n_drones)])
+                        if not va.any(): break
+                        vt = torch.tensor(vo, dtype=torch.float32).to(device)
+                        vacts = np.zeros(n_drones, dtype=np.int32)
+                        for vi in range(n_drones):
+                            if not va[vi]: continue
+                            vlogits, _ = policy_net(vt[vi:vi+1])
+                            vacts[vi] = torch.distributions.Categorical(logits=vlogits).sample().item()
+                        vo, _, vd, _ = ve.step(vacts)
+                        for j in range(n_drones):
+                            if va[j] and vd[j] and not ve.drones[j]['alive']: vc += 1
+                        if all(vd): break
+                    val_c.append(len(ve.total_cells_explored)/(grid*grid)*100)
+                    val_s.append((1.0-vc/n_drones)*100)
+                print(f"         VAL | Cov: {np.mean(val_c):5.1f}% \u00b1 {np.std(val_c):4.1f} | Safe: {np.mean(val_s):4.0f}%", flush=True)
     except (KeyboardInterrupt, SystemExit, Exception) as e:
         print(f"\nTraining interrupted at ep {ep+1}: {e}", flush=True)
 
@@ -750,13 +815,11 @@ def train_mappo(n_episodes=800, grid=30, n_drones=10, max_steps=150, seed=0):
     with open(f'mappo_s{seed}_training_results.json', 'w') as f: json.dump(results, f, indent=2)
     print(f"\nDone in {time.time()-t0:.0f}s | Reward: {results['final_reward']:.1f} | Coverage: {results['final_coverage']:.1f}% | Safety: {results['final_safety']:.0f}%", flush=True)
 
-    # Wrap in FastGATPPO for compatibility
-    tmp_env = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps)
-    wrapper = FastGATPPO(obs_dim=tmp_env.obs_dim, act_dim=tmp_env.act_dim, use_gat=False)
-    del tmp_env
-    wrapper.policy.load_state_dict(policy_net.state_dict())
-    wrapper.save(f'mappo_best.pt')
-    return wrapper, results
+    # Save raw policy+critic weights (MAPPO has its own architecture,
+    # no need to force into FastGATPPO wrapper which expects GAT dims)
+    results['policy_state'] = policy_net.state_dict()
+    results['critic_state'] = critic.state_dict()
+    return policy_net, results
 
 
 def train_mappo_multi_seed(n_episodes, grid, n_drones, max_steps, seeds=[42, 123]):
@@ -781,7 +844,7 @@ def train_mappo_multi_seed(n_episodes, grid, n_drones, max_steps, seeds=[42, 123
 # SECTION 6: BENCHMARK
 # ═══════════════════════════════════════════════════════════════
 
-def benchmark(agent, grid=30, n_drones=10, max_steps=150, wind=12.0, n_eps=20):
+def benchmark(agent, grid=30, n_drones=10, max_steps=300, wind=12.0, n_eps=20):
     print(f"\n{'='*60}\nBENCHMARK | wind={wind} | {n_drones} drones | {n_eps} eps\n{'='*60}", flush=True)
     results = {}
 
@@ -860,7 +923,7 @@ def benchmark(agent, grid=30, n_drones=10, max_steps=150, wind=12.0, n_eps=20):
 # SECTION 7: WIND SWEEP
 # ═══════════════════════════════════════════════════════════════
 
-def wind_sweep(agent, grid=30, n_drones=10, max_steps=150, n_eps=15):
+def wind_sweep(agent, grid=30, n_drones=10, max_steps=300, n_eps=15):
     print(f"\n{'='*60}\nWIND SWEEP | {n_drones} drones | {n_eps} episodes each\n{'='*60}", flush=True)
     sweep = {}
     for wind in [5, 10, 15, 20, 25]:
@@ -896,7 +959,7 @@ def wind_sweep(agent, grid=30, n_drones=10, max_steps=150, n_eps=15):
 # SECTION 8: FIGURES
 # ═══════════════════════════════════════════════════════════════
 
-def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=None, grid=30, n_drones=10, max_steps=150):
+def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=None, grid=30, n_drones=10, max_steps=300):
     import matplotlib; matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     os.makedirs('figures_gat', exist_ok=True)
@@ -1015,7 +1078,7 @@ if __name__ == "__main__":
 
     GRID = 30
     N_DRONES = 10
-    MAX_STEPS = 150
+    MAX_STEPS = 300
     N_EPISODES = 800
     SEEDS = [42, 123]
 

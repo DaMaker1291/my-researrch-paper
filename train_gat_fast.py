@@ -55,7 +55,7 @@ class FastGATPPO:
         return (actions.cpu().numpy(), log_probs.cpu().numpy(), 
                 values.cpu().numpy(), enhanced.detach())
     
-    def store(self, enhanced_obs, actions, rewards, dones, log_probs, values):
+    def store(self, enhanced_obs, actions, rewards, dones, log_probs, values, agent_ids=None):
         """Store a batch of transitions with cached enhanced observations."""
         K = len(actions)
         for i in range(K):
@@ -66,6 +66,7 @@ class FastGATPPO:
                 'done': dones[i],
                 'log_prob': log_probs[i],
                 'value': values[i],
+                'agent_id': agent_ids[i] if agent_ids is not None else 0,
             })
     
     def update(self, gamma=0.99, gae_lambda=0.95, n_epochs=4,
@@ -79,17 +80,27 @@ class FastGATPPO:
         values = np.array([t['value'] for t in self._traj], dtype=np.float32)
         dones = np.array([t['done'] for t in self._traj], dtype=np.float32)
         
-        # GAE (single trajectory — all drones mixed, simplified)
+        # Per-drone GAE: transitions are interleaved across agents,
+        # so compute GAE within each agent's sequence separately
         advantages = np.zeros(n, dtype=np.float32)
         returns = np.zeros(n, dtype=np.float32)
-        gae = 0.0
-        for step in reversed(range(n)):
-            next_val = 0.0 if step == n - 1 else values[step + 1]
-            next_done = 1.0 if step == n - 1 else dones[step + 1]
-            delta = rewards[step] + gamma * next_val * (1 - next_done) - values[step]
-            gae = delta + gamma * gae_lambda * (1 - next_done) * gae
-            advantages[step] = gae
-            returns[step] = gae + values[step]
+        agent_groups = {}
+        for i, t in enumerate(self._traj):
+            aid = t.get('agent_id', 0)
+            if aid not in agent_groups:
+                agent_groups[aid] = []
+            agent_groups[aid].append(i)
+        for aid, indices in agent_groups.items():
+            gae = 0.0
+            for k in reversed(range(len(indices))):
+                idx = indices[k]
+                next_idx = indices[k+1] if k+1 < len(indices) else None
+                next_val = 0.0 if next_idx is None else self._traj[next_idx]['value']
+                next_done = 1.0 if next_idx is None else self._traj[next_idx]['done']
+                delta = self._traj[idx]['reward'] + gamma * next_val * (1-next_done) - self._traj[idx]['value']
+                gae = delta + gamma * gae_lambda * (1-next_done) * gae
+                advantages[idx] = gae
+                returns[idx] = gae + self._traj[idx]['value']
         
         # Build tensors from cached data
         all_obs = torch.stack([t['obs'].squeeze(0) for t in self._traj])
@@ -143,32 +154,48 @@ class FastGATPPO:
 
 
 def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashed, step, max_steps, grid_size):
-    if crashed:
-        return -15.0
-    reward = 0.05
+    """Balanced reward: survival-first exploration for multi-agent wildfire tracking.
+
+    Incentive hierarchy:
+      1. Staying alive (+1.0/step, +30 at episode end) — dominant signal
+      2. Exploring new cells (+8/cell) — worth pursuing, not worth dying for
+      3. Fire-front observation (+5 when close) — mild tracking nudge
+      4. Coordination penalties — avoid clustering (capped)
+    """
+    if crashed: return -40.0  # strong penalty: crashing is always bad
+
+    reward = 0.0
+
+    # 1. Per-step survival reward (dominant: ~300 over a full episode)
+    reward += 1.0
+
+    # 2. Exploration: +8 per NEW cell the team hasn't visited
     new_cells = sum(1 for c in drone['visited'] if c not in prev_visited)
-    reward += 25.0 * new_cells
-    # Overlap penalty: -3 per alive drone within 3 cells
+    reward += 8.0 * new_cells
+
+    # 3. Fire front bonus: +5 for being near fire (mild tracking nudge)
+    if 0.5 < fire_dist < 4.0:
+        reward += 5.0 * (1.0 - fire_dist / 4.0)
+
+    # 4. Overlap penalty: -1.0 per drone within range 2, capped at -3.0
     nearby = 0
     for j, other in enumerate(all_drones):
         if j != drone_idx and other['alive']:
-            if np.linalg.norm(drone['pos'] - other['pos']) < 3.0:
+            if np.linalg.norm(drone['pos'] - other['pos']) < 2.0:
                 nearby += 1
-    reward -= 3.0 * nearby
-    # Diversity bonus: reward for occupying under-represented quadrants
+    reward -= min(3.0, 1.0 * nearby)
+
+    # 5. Quadrant diversity: +2 / count in same quadrant
     mid = grid_size / 2.0
-    qx, qy = int(drone['pos'][0] >= mid), int(drone['pos'][1] >= mid)
-    q = qx + 2 * qy
-    qcounts = [0]*4
-    for other in all_drones:
-        if other['alive']:
-            qcounts[int(other['pos'][0] >= mid) + 2*int(other['pos'][1] >= mid)] += 1
-    reward += 2.0 / max(1, qcounts[q])
-    # Fire proximity (reduced from 8.0 to 2.0)
-    if fire_dist < 3.0:
-        reward += 2.0 * (1.0 - fire_dist / 3.0)
+    q = int(drone['pos'][0] >= mid) + 2 * int(drone['pos'][1] >= mid)
+    qcount = sum(1 for o in all_drones if o['alive'] and
+                 int(o['pos'][0] >= mid) + 2*int(o['pos'][1] >= mid) == q)
+    reward += 2.0 / max(1, qcount)
+
+    # 6. Episode completion bonus (large: rewards patience)
     if step >= max_steps - 1:
-        reward += 5.0
+        reward += 30.0
+
     return reward
 
 
@@ -227,13 +254,13 @@ def train(n_episodes=3000, grid=30, n_drones=10, max_steps=300):
                 d = env.drones[i]
                 prev_v = prev_visited[i]
                 fd = infos[i].get('fire_dist', 10.0)
-                shaped_rewards[i] = compute_reward(d, i, env.drones, prev_v, fd, dones[i], step, max_steps, grid)
+                crashed = infos[i].get('crashed', False)
+                shaped_rewards[i] = compute_reward(d, i, env.drones, prev_v, fd, crashed, step, max_steps, grid)
                 ep_r += shaped_rewards[i]
-                if dones[i] and not d['alive']:
-                    ep_crashes += 1
+                if crashed: ep_crashes += 1
             
-            # Store with enhanced obs
-            agent.store(enhanced, actions, shaped_rewards, dones.astype(np.float32), log_probs, values)
+            # Store with enhanced obs (include agent_ids for per-drone GAE)
+            agent.store(enhanced, actions, shaped_rewards, dones.astype(np.float32), log_probs, values, agent_ids=list(range(n_drones)))
             
             obs = obs_next
             if all(dones):
