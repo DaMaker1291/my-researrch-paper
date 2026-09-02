@@ -488,22 +488,15 @@ def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashe
     if step >= max_steps - 1: reward += 5.0
     return reward
 
-def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, seed=0, run_id="gat", curriculum=True):
+def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, seed=0, run_id="gat"):
     torch.manual_seed(seed); np.random.seed(seed)
     print(f"\n{'='*60}", flush=True)
     tag = "GAT-MARAHS" if use_gat else "No-GAT (Ablation)"
-    curr_tag = " (grid curriculum: 15→30)" if curriculum else ""
-    print(f"{tag}{curr_tag} | seed={seed} | {n_episodes} eps | {n_drones} drones | {grid}x{grid}", flush=True)
+    print(f"{tag} | seed={seed} | {n_episodes} eps | {n_drones} drones | {grid}x{grid}", flush=True)
     print(f"{'='*60}", flush=True)
 
-    # Grid-size curriculum: start small (fast), scale to target grid
-    if curriculum:
-        curr_schedule = [(0, 100, 15), (100, 200, 20), (200, 350, 25), (350, n_episodes, grid)]
-    else:
-        curr_schedule = [(0, n_episodes, grid)]
-
-    cur_grid = curr_schedule[0][2]
-    env = WildfireEnv(grid=cur_grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+    # Train directly on target grid (no curriculum - it destroys policies on grid resize)
+    env = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
     agent = FastGATPPO(obs_dim=env.obs_dim, act_dim=env.act_dim, use_gat=use_gat)
 
     rewards_h, coverage_h, safety_h = [], [], []
@@ -515,15 +508,6 @@ def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, see
 
     try:
       for ep in range(n_episodes):
-        # Grid-size curriculum: resize env when grid changes
-        new_grid = cur_grid
-        for start, end, g in curr_schedule:
-            if start <= ep < end:
-                new_grid = g; break
-        if new_grid != cur_grid:
-            cur_grid = new_grid
-            env = WildfireEnv(grid=cur_grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
-            print(f"  Curriculum: grid → {cur_grid}x{cur_grid} at ep {ep+1}", flush=True)
         env.base_wind = 0
         obs = env.reset()
         agent._traj.clear()
@@ -540,7 +524,7 @@ def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, see
             for i in range(n_drones):
                 if not am[i]: continue
                 fd = infos[i].get('fire_dist', 10.0)
-                shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, dones[i], step, max_steps, cur_grid)
+                shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, dones[i], step, max_steps, grid)
                 ep_r += shaped[i]
                 if dones[i] and not env.drones[i]['alive']: ep_crashes += 1
             agent.store(enhanced, actions, shaped, dones.astype(np.float32), log_probs, values)
@@ -611,14 +595,14 @@ def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, see
 # SECTION 4: MULTI-SEED TRAINING
 # ═══════════════════════════════════════════════════════════════
 
-def train_multi_seed(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, seeds=[42, 123], curriculum=True):
+def train_multi_seed(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, seeds=[42, 123]):
     run_id = "gat" if use_gat else "nogat"
     all_results = []
     for i, seed in enumerate(seeds):
         print(f"\n{'#'*60}", flush=True)
         print(f"# Run {i+1}/{len(seeds)} | seed={seed}", flush=True)
         print(f"{'#'*60}", flush=True)
-        agent, res = train(n_episodes, grid, n_drones, max_steps, use_gat=use_gat, seed=seed, run_id=f"{run_id}_s{seed}", curriculum=curriculum)
+        agent, res = train(n_episodes, grid, n_drones, max_steps, use_gat=use_gat, seed=seed, run_id=f"{run_id}_s{seed}")
         all_results.append(res)
         # Save best model from this seed
         agent.save(f'{run_id}_seed{seed}_best.pt')
