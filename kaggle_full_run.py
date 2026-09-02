@@ -137,7 +137,9 @@ class WildfireEnv:
             return
         # Vectorized min-distance: compute all distances at once via broadcasting
         yy, xx = np.meshgrid(np.arange(self.grid, dtype=np.float32), np.arange(self.grid, dtype=np.float32), indexing='ij')
-        all_dists = np.sqrt((xx[None,:,:] - fire_cells[:,1:2])**2 + (yy[None,:,:] - fire_cells[:,0:1])**2)
+        fire_y = fire_cells[:, 0].reshape(-1, 1, 1)  # (N,1,1)
+        fire_x = fire_cells[:, 1].reshape(-1, 1, 1)  # (N,1,1)
+        all_dists = np.sqrt((xx[None, :, :] - fire_x)**2 + (yy[None, :, :] - fire_y)**2)
         self._fire_dist_cache = np.min(all_dists, axis=0).astype(np.float32)
 
     def _spread_fire(self, rng):
