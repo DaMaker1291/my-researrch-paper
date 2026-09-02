@@ -13,14 +13,14 @@ Research contributions:
   5. Ablation: GAT vs No-GAT vs MAPPO baseline
 
 Pipeline:
-  1. Train GAT-MARAHS × 3 seeds (wind curriculum 0→15 m/s)
-  2. Train No-GAT ablation × 3 seeds
-  3. Train MAPPO baseline × 3 seeds
+  1. Train GAT-MARAHS × 2 seeds (wind curriculum 0→10 m/s)
+  2. Train No-GAT ablation × 2 seeds (ablation study)
+  3. Train MAPPO baseline × 2 seeds (SOTA comparison)
   4. Benchmark vs Random / Greedy / PID baselines
   5. Wind sweep (5/10/15/20/25 m/s) with error bars
   6. Generate publication figures with confidence intervals
 
-Runtime: ~7-8 hours on Kaggle GPU (T4)
+Runtime: ~5-6 hours on Kaggle GPU (T4)
 Memory: ~4GB
 Kaggle limits: 9hr hard cap (GPU), ~40min idle timeout
 """
@@ -264,21 +264,18 @@ class MultiHeadAttention(nn.Module):
 
 
 class GATCommunication(nn.Module):
-    def __init__(self, in_dim=656, hidden_dim=256, out_dim=64, n_heads=4, comm_range=15.0):
+    def __init__(self, in_dim=656, hidden_dim=128, out_dim=64, n_heads=4, comm_range=15.0):
         super().__init__()
         self.in_dim, self.out_dim, self.comm_range = in_dim, out_dim, comm_range
-        # 3-layer GAT with residual connections
+        # 2-layer GAT with residual connections (faster than 3-layer)
         self.attn1 = MultiHeadAttention(in_dim, hidden_dim, n_heads)
-        self.attn2 = MultiHeadAttention(hidden_dim, hidden_dim, n_heads)
-        self.attn3 = MultiHeadAttention(hidden_dim, out_dim, n_heads)
+        self.attn2 = MultiHeadAttention(hidden_dim, out_dim, n_heads)
         self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.norm3 = nn.LayerNorm(out_dim)
+        self.norm2 = nn.LayerNorm(out_dim)
         self.output_proj = nn.Linear(out_dim, out_dim)
         # Residual projections
         self.res1 = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
-        self.res2 = nn.Linear(hidden_dim, hidden_dim)
-        self.res3 = nn.Linear(hidden_dim, out_dim)
+        self.res2 = nn.Linear(hidden_dim, out_dim)
 
     def build_graph(self, positions, alive_mask):
         K = len(positions)
@@ -298,9 +295,7 @@ class GATCommunication(nn.Module):
         h1 = F.relu(self.norm1(self.attn1(obs, adj) + self.res1(obs)))
         # Layer 2 with residual
         h2 = F.relu(self.norm2(self.attn2(h1, adj) + self.res2(h1)))
-        # Layer 3 with residual
-        h3 = F.relu(self.norm3(self.attn3(h2, adj) + self.res3(h2)))
-        out = torch.cat([obs, self.output_proj(h3)], dim=1)
+        out = torch.cat([obs, self.output_proj(h2)], dim=1)
         return out
 
     @property
@@ -308,13 +303,12 @@ class GATCommunication(nn.Module):
 
 
 class NoGATCommunication(nn.Module):
-    """Ablation: replaces GAT with a 3-layer MLP — no inter-agent communication."""
+    """Ablation: replaces GAT with a 2-layer MLP — no inter-agent communication."""
     def __init__(self, in_dim=656, out_dim=64):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 256), nn.ReLU(), nn.LayerNorm(256),
-            nn.Linear(256, 256), nn.ReLU(), nn.LayerNorm(256),
-            nn.Linear(256, out_dim)
+            nn.Linear(in_dim, 128), nn.ReLU(), nn.LayerNorm(128),
+            nn.Linear(128, out_dim)
         )
         self._in_dim = in_dim
         self._out_dim = out_dim
@@ -354,7 +348,7 @@ class PPONetwork(nn.Module):
 
 
 class FastGATPPO:
-    def __init__(self, obs_dim=656, act_dim=5, use_gat=True, gat_hidden=256, gat_out=64, n_heads=4, comm_range=15.0, lr=1e-4):
+    def __init__(self, obs_dim=656, act_dim=5, use_gat=True, gat_hidden=128, gat_out=64, n_heads=4, comm_range=15.0, lr=3e-4):
         if use_gat:
             self.gat = GATCommunication(obs_dim, gat_hidden, gat_out, n_heads, comm_range).to(device)
         else:
@@ -439,47 +433,40 @@ def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashe
     """
     Information-theoretic reward shaping for multi-agent wildfire tracking.
 
-    Components:
-      1. Survival: +0.1/step (stay alive)
-      2. Exploration: +50 per new cell (strong exploration incentive)
-      3. Fire observation: +20 for observing fire front cells (high-information regions)
-      4. Overlap penalty: -8 per nearby drone (enforce spatial diversity)
-      5. Quadrant diversity: +5/count (balance across grid regions)
-      6. Fire proximity: +3*(1-d/3) if d<3 (approach fire safely)
-      7. Crash: -10 (penalize death, but not too harsh to encourage exploration)
+    Key insight: reward exploration (+), penalize overlap (-), reward fire observation (+)
     """
     if crashed: return -10.0
 
     reward = 0.1  # survival bonus
 
-    # Exploration bonus: +50 per new cell
+    # Exploration: +30 per new cell (was +50, reduced to avoid overwhelming other signals)
     new_cells = sum(1 for c in drone['visited'] if c not in prev_visited)
-    reward += 50.0 * new_cells
+    reward += 30.0 * new_cells
 
-    # Fire front observation: +20 for observing fire front (high information)
+    # Fire front observation: +15 (high-information regions)
     if new_cells > 0 and 1.0 < fire_dist < 5.0:
-        reward += 20.0
+        reward += 15.0
 
-    # Overlap penalty: -8 per nearby drone (spatial diversity)
+    # Overlap penalty: -5 per nearby drone (was -8, reduced to avoid timid behavior)
     nearby = sum(1 for j, other in enumerate(all_drones)
                  if j != drone_idx and other['alive'] and np.linalg.norm(drone['pos'] - other['pos']) < 3.0)
-    reward -= 8.0 * nearby
+    reward -= 5.0 * nearby
 
-    # Quadrant diversity bonus: +5/count (balance across grid)
+    # Quadrant diversity: +3/count (balance across grid)
     mid = grid_size / 2.0
     q = int(drone['pos'][0] >= mid) + 2 * int(drone['pos'][1] >= mid)
     qcounts = [sum(1 for other in all_drones if other['alive'] and
                    int(other['pos'][0] >= mid) + 2*int(other['pos'][1] >= mid) == k)
                for k in range(4)]
-    reward += 5.0 / max(1, qcounts[q])
+    reward += 3.0 / max(1, qcounts[q])
 
     # Fire proximity bonus (safe approach)
     if fire_dist < 3.0:
-        reward += 3.0 * (1.0 - fire_dist / 3.0)
+        reward += 2.0 * (1.0 - fire_dist / 3.0)
 
     # Episode completion bonus
     if step >= max_steps - 1:
-        reward += 10.0
+        reward += 5.0
 
     return reward
 
@@ -489,15 +476,13 @@ def compute_reward(drone, drone_idx, all_drones, prev_visited, fire_dist, crashe
 # ═══════════════════════════════════════════════════════════════
 
 def get_wind_for_episode(ep, n_episodes):
-    """Wind curriculum: start at 0, ramp to 15 m/s over training."""
-    if ep < n_episodes * 0.2:
-        return 0.0  # First 20%: calm
-    elif ep < n_episodes * 0.5:
+    """Wind curriculum: gentle ramp 0→10 m/s over training."""
+    if ep < n_episodes * 0.3:
+        return 0.0  # First 30%: calm (learn exploration)
+    elif ep < n_episodes * 0.6:
         return 5.0  # Next 30%: light wind
-    elif ep < n_episodes * 0.75:
-        return 10.0  # Next 25%: moderate wind
     else:
-        return 15.0  # Final 25%: strong wind
+        return 10.0  # Final 40%: moderate wind (not too extreme)
 
 
 def train(n_episodes=800, grid=30, n_drones=10, max_steps=150, use_gat=True, seed=0, run_id="gat"):
@@ -942,7 +927,7 @@ def wind_sweep(agent, grid=30, n_drones=10, max_steps=150, n_eps=15):
 # SECTION 8: FIGURES
 # ═══════════════════════════════════════════════════════════════
 
-def generate_figures(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_res):
+def generate_figures(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_res, gat_agent=None, grid=30, n_drones=10, max_steps=150):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1027,7 +1012,32 @@ def generate_figures(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_
     ax.legend(); ax.grid(True, axis='y', alpha=0.3); ax.set_ylim(0, 100)
     plt.tight_layout(); plt.savefig('figures_gat/fig4_ablation.png'); plt.close()
 
-    print("  \u2713 4 figures saved to figures_gat/", flush=True)
+    # Fig 5: Real attention pattern from trained GAT
+    if gat_agent is not None:
+        try:
+            env_a = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+            obs_a = env_a.reset()
+            am_a = np.array([env_a.drones[i]['alive'] for i in range(n_drones)])
+            pos_a = np.array([env_a.drones[i]['pos'] for i in range(n_drones)], dtype=np.float32)
+            obs_t = torch.tensor(obs_a, dtype=torch.float32).to(device)
+            pos_t = torch.tensor(pos_a, dtype=torch.float32).to(device)
+            alive_t = torch.tensor(am_a, dtype=torch.bool).to(device)
+            adj = gat_agent.gat.build_graph(pos_t, alive_t)
+            h1 = F.relu(gat_agent.gat.norm1(gat_agent.gat.attn1(obs_t, adj) + gat_agent.gat.res1(obs_t)))
+            _, attn_weights = gat_agent.gat.attn2(h1, adj, return_attn=True)
+            attn_np = attn_weights.mean(dim=-1).detach().cpu().numpy()
+            n_a = attn_np.shape[0]
+            fig, ax = plt.subplots(figsize=(6, 5))
+            im = ax.imshow(attn_np, cmap='YlOrRd', vmin=0)
+            ax.set_xlabel('Receiver Agent'); ax.set_ylabel('Sender Agent')
+            ax.set_title('GAT Attention Weights (learned communication)')
+            ax.set_xticks(range(n_a)); ax.set_yticks(range(n_a))
+            plt.colorbar(im, ax=ax, label='Attention weight')
+            plt.tight_layout(); plt.savefig('figures_gat/fig5_attention.png'); plt.close()
+        except Exception as e:
+            print(f"  Warning: could not extract attention: {e}", flush=True)
+
+    print("  \u2713 5 figures saved to figures_gat/", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1042,8 +1052,8 @@ if __name__ == "__main__":
     GRID = 30
     N_DRONES = 10
     MAX_STEPS = 150
-    N_EPISODES = 800
-    SEEDS = [42, 123, 777]
+    N_EPISODES = 500
+    SEEDS = [42, 123]
 
     t_total = time.time()
 
@@ -1059,9 +1069,9 @@ if __name__ == "__main__":
     print("#"*60, flush=True)
     nogat_agent, nogat_all_res = train_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, use_gat=False, seeds=SEEDS)
 
-    # Step 3: Train MAPPO baseline × 3 seeds
+    # Step 3: Train MAPPO baseline × 2 seeds
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 3: Train MAPPO baseline (3 seeds)", flush=True)
+    print("# PHASE 3: Train MAPPO baseline (2 seeds)", flush=True)
     print("#"*60, flush=True)
     mappo_agent, mappo_all_res = train_mappo_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, seeds=SEEDS)
 
@@ -1081,7 +1091,7 @@ if __name__ == "__main__":
     print("\n" + "#"*60, flush=True)
     print("# PHASE 6: Generate publication figures", flush=True)
     print("#"*60, flush=True)
-    generate_figures(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_res)
+    generate_figures(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_res, gat_agent, GRID, N_DRONES, MAX_STEPS)
 
     # Summary
     total_time = time.time() - t_total
@@ -1089,7 +1099,7 @@ if __name__ == "__main__":
     print("COMPLETE!", flush=True)
     print("="*60, flush=True)
     print(f"Total time: {total_time/60:.1f} minutes ({total_time/3600:.1f} hours)", flush=True)
-    print(f"\nGAT-MARAHS ({len(SEEDS)} seeds, wind curriculum 0->15):", flush=True)
+    print(f"\nGAT-MARAHS ({len(SEEDS)} seeds, wind curriculum 0->10):", flush=True)
     print(f"  Coverage: {np.mean([r['final_coverage'] for r in gat_all_res]):.1f}% +/- {np.std([r['final_coverage'] for r in gat_all_res]):.1f}%", flush=True)
     print(f"  Safety:   {np.mean([r['final_safety'] for r in gat_all_res]):.1f}% +/- {np.std([r['final_safety'] for r in gat_all_res]):.1f}%", flush=True)
     print(f"\nNo-GAT ablation ({len(SEEDS)} seeds):", flush=True)
