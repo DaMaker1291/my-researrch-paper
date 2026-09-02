@@ -534,7 +534,7 @@ def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, see
             if all(dones): break
 
         loss = agent.update()
-        cov = len(env.total_cells_explored) / (cur_grid*cur_grid) * 100
+        cov = len(env.total_cells_explored) / (grid*grid) * 100
         saf = (1.0 - ep_crashes / n_drones) * 100
 
         rewards_h.append(ep_r); coverage_h.append(cov); safety_h.append(saf)
@@ -553,7 +553,7 @@ def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, see
             # Held-out validation (3 episodes for speed)
             val_c, val_s = [], []
             for _ in range(3):
-                ve = WildfireEnv(grid=cur_grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+                ve = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
                 vo = ve.reset()
                 vc_count = 0
                 for _ in range(max_steps):
@@ -565,7 +565,7 @@ def train(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_gat=True, see
                     for i2 in range(n_drones):
                         if va[i2] and vd[i2] and not ve.drones[i2]['alive']: vc_count += 1
                     if all(vd): break
-                val_c.append(len(ve.total_cells_explored)/(cur_grid*cur_grid)*100)
+                val_c.append(len(ve.total_cells_explored)/(grid*grid)*100)
                 val_s.append((1.0-vc_count/n_drones)*100)
             print(f"         VAL | Cov: {np.mean(val_c):5.1f}% ± {np.std(val_c):4.1f} | Safe: {np.mean(val_s):4.0f}%", flush=True)
             if avg_cov >= early_stop_target:
