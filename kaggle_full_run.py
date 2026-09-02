@@ -624,12 +624,14 @@ def train_multi_seed(n_episodes=500, grid=30, n_drones=10, max_steps=150, use_ga
     # Pick best seed's model as representative
     best_idx = np.argmax(final_covs)
     best_agent_seed = seeds[best_idx]
-    # Load best model
-    best_agent = FastGATPPO(obs_dim=env.obs_dim if 'env' in dir() else 520, act_dim=5, use_gat=use_gat)
+    # Load best model with correct obs_dim (env is local to train(), not accessible here)
+    _tmp_env = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+    best_agent = FastGATPPO(obs_dim=_tmp_env.obs_dim, act_dim=_tmp_env.act_dim, use_gat=use_gat)
+    del _tmp_env
     try:
         best_agent.load(f'{run_id}_seed{best_agent_seed}_best.pt')
-    except:
-        pass  # If load fails, use last trained agent
+    except Exception as e:
+        print(f"  Warning: could not load best model: {e}", flush=True)
 
     return best_agent, all_results
 
