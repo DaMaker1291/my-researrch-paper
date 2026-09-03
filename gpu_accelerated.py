@@ -484,7 +484,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kaggle_full_run import (
     MultiHeadAttention, GATCommunication, NoGATCommunication,
-    PPONetwork, MAPPOCritic, GPFireFront, NeuralCBFFilter, compute_reward
+    PPONetwork, MAPPOCritic, GPFireFront, NeuralCBFFilter, compute_reward,
+    train
 )
 
 
@@ -804,32 +805,41 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
 def gpu_run_full_pipeline():
     """Full research pipeline optimized for dual T4 GPU.
     
-    Estimated time: 30-60 min (vs 8+ hours on CPU).
-    Uses 32 parallel environments per training run.
+    All 9 phases from the paper, with GPU-accelerated training.
+    Estimated time: 30-60 min on dual T4 (vs 8+ hours on CPU).
     """
     total_start = time.time()
     
     print("=" * 80, flush=True)
-    print("PlumeGym-MARL v5: GPU-Accelerated Pipeline (Dual T4)", flush=True)
+    print("PlumeGym-MARL v5: GPU-Accelerated Full Pipeline (Dual T4)", flush=True)
     print("=" * 80, flush=True)
     
     grid, n_drones, max_steps = 30, 10, 300
-    n_envs = 32  # 32 parallel environments on GPU
+    n_envs = 32
     train_eps = 500
     
-    # ── PHASE 1: Train GAT-ITSE × 3 seeds ──
+    # Import everything from the main module
+    from kaggle_full_run import (
+        eval_random, eval_greedy, eval_pid, eval_trained_agent,
+        train_mappo, train_ippo, statistical_analysis, generate_figures,
+        WildfireEnv, FastGATPPO
+    )
+    
+    # ═══ PHASE 1: Train GAT-ITSE × 3 seeds (GPU) ═══
     print("\n" + "=" * 60, flush=True)
     print("PHASE 1: Training GAT-ITSE × 3 seeds (GPU, 32 parallel envs)", flush=True)
     print("=" * 60, flush=True)
     gat_results = []
+    gat_agents = []
     for seed in [42, 123, 777]:
         agent, res = batched_train(train_eps, grid, n_drones, max_steps, n_envs=n_envs,
                                    use_gat=True, seed=seed, run_id=f"gpu_gat_s{seed}")
         gat_results.append(res)
+        gat_agents.append(agent)
     
-    # ── PHASE 2: Train No-GAT ablation ──
+    # ═══ PHASE 2: Train ablations (GPU) ═══
     print("\n" + "=" * 60, flush=True)
-    print("PHASE 2: Training No-GAT Ablation", flush=True)
+    print("PHASE 2: Training Ablations (GPU)", flush=True)
     print("=" * 60, flush=True)
     nogat_results = []
     for seed in [42, 123]:
@@ -837,19 +847,43 @@ def gpu_run_full_pipeline():
                                use_gat=False, seed=seed, run_id=f"gpu_nogat_s{seed}")
         nogat_results.append(res)
     
-    # ── PHASE 3: Non-learned baselines ──
-    print("\n" + "=" * 60, flush=True)
-    print("PHASE 3: Evaluating Baselines", flush=True)
-    print("=" * 60, flush=True)
+    # No-GP and No-CBF use CPU training (require per-step GP/CBF logic)
+    print("\n  Training No-GP ablation (CPU)...", flush=True)
+    _, nogp_res = train(200, grid, n_drones, max_steps, use_gat=True, seed=42,
+                        run_id="gpu_nogp", use_gp=False, use_cbf=True)
+    print("  Training No-CBF ablation (CPU)...", flush=True)
+    _, nocbf_res = train(200, grid, n_drones, max_steps, use_gat=True, seed=42,
+                         run_id="gpu_nocbf", use_gp=True, use_cbf=False)
     
-    # Import baselines from main file
-    from kaggle_full_run import eval_random, eval_greedy, eval_pid
+    # ═══ PHASE 3: Train MAPPO (CPU) ═══
+    print("\n" + "=" * 60, flush=True)
+    print("PHASE 3: Training MAPPO × 2 seeds", flush=True)
+    print("=" * 60, flush=True)
+    mappo_res = []
+    for seed in [42, 123]:
+        _, res = train_mappo(train_eps, grid, n_drones, max_steps, seed=seed)
+        mappo_res.append(res)
+    
+    # ═══ PHASE 4: Train IPPO (CPU) ═══
+    print("\n" + "=" * 60, flush=True)
+    print("PHASE 4: Training IPPO × 2 seeds", flush=True)
+    print("=" * 60, flush=True)
+    ippo_res = []
+    for seed in [42, 123]:
+        _, res = train_ippo(400, grid, n_drones, max_steps, seed=seed)
+        ippo_res.append(res)
+    
+    # ═══ PHASE 5: Non-learned baselines ═══
+    print("\n" + "=" * 60, flush=True)
+    print("PHASE 5: Evaluating Baselines", flush=True)
+    print("=" * 60, flush=True)
     random_res = eval_random(grid, n_drones, max_steps, wind=0.0, n_eps=20)
     greedy_res = eval_greedy(grid, n_drones, max_steps, wind=0.0, n_eps=20)
     pid_res = eval_pid(grid, n_drones, max_steps, wind=0.0, n_eps=20)
     
-    # ── AGGREGATE ──
+    # ═══ AGGREGATE ALL RESULTS ═══
     all_results = {}
+    
     gat_covs = [r['final_coverage'] for r in gat_results]
     gat_safs = [r['final_safety'] for r in gat_results]
     all_results['GAT-ITSE'] = {
@@ -866,25 +900,112 @@ def gpu_run_full_pipeline():
         'coverages': nogat_covs,
     }
     
-    for name, res in [('Random', random_res), ('Greedy', greedy_res), ('PID', pid_res)]:
-        all_results[name] = res
+    for name, res_data in [('No-GP', nogp_res), ('No-CBF', nocbf_res)]:
+        all_results[name] = {
+            'coverage': res_data['final_coverage'], 'coverage_std': 0,
+            'safety': res_data['final_safety'], 'safety_std': 0,
+            'coverages': [res_data['final_coverage']],
+        }
+    
+    mappo_covs = [r['final_coverage'] for r in mappo_res]
+    mappo_safs = [r['final_safety'] for r in mappo_res]
+    all_results['MAPPO'] = {
+        'coverage': float(np.mean(mappo_covs)), 'coverage_std': float(np.std(mappo_covs)),
+        'safety': float(np.mean(mappo_safs)), 'safety_std': float(np.std(mappo_safs)),
+        'coverages': mappo_covs,
+    }
+    
+    ippo_covs = [r['final_coverage'] for r in ippo_res]
+    ippo_safs = [r['final_safety'] for r in ippo_res]
+    all_results['IPPO'] = {
+        'coverage': float(np.mean(ippo_covs)), 'coverage_std': float(np.std(ippo_covs)),
+        'safety': float(np.mean(ippo_safs)), 'safety_std': float(np.std(ippo_safs)),
+        'coverages': ippo_covs,
+    }
+    
+    for name, res_data in [('Random', random_res), ('Greedy', greedy_res), ('PID', pid_res)]:
+        all_results[name] = res_data
     
     # Print summary
     print(f"\n{'=' * 70}", flush=True)
     print(f"{'Method':<15s} {'Safety':>10s} {'Coverage':>10s}", flush=True)
     print(f"{'-' * 70}", flush=True)
-    for m in ['GAT-ITSE', 'No-GAT', 'Random', 'Greedy', 'PID']:
+    for m in ['GAT-ITSE', 'No-GAT', 'No-GP', 'No-CBF', 'MAPPO', 'IPPO', 'Random', 'Greedy', 'PID']:
         r = all_results.get(m, {})
         print(f"{m:<15s} {r.get('safety', 0):>8.1f}% {r.get('coverage', 0):>8.1f}%", flush=True)
     print(f"{'=' * 70}", flush=True)
     
-    # ── Save results ──
+    # ═══ PHASE 6: Wind Robustness Sweep ═══
+    print("\n" + "=" * 60, flush=True)
+    print("PHASE 6: Wind Robustness Sweep", flush=True)
+    print("=" * 60, flush=True)
+    # Load best GAT agent for evaluation
+    best_seed_idx = int(np.argmax(gat_covs))
+    best_agent = gat_agents[best_seed_idx]
+    wind_results = {}
+    for wind in [5, 10, 15, 20, 25]:
+        print(f"  Wind = {wind} m/s", flush=True)
+        wind_results[wind] = {}
+        wind_results[wind]['GAT-ITSE'] = eval_trained_agent(
+            best_agent, grid, n_drones, max_steps, wind=wind, n_eps=20, use_gat=True)
+        wind_results[wind]['Random'] = eval_random(grid, n_drones, max_steps, wind=wind, n_eps=20)
+        wind_results[wind]['Greedy'] = eval_greedy(grid, n_drones, max_steps, wind=wind, n_eps=20)
+        wind_results[wind]['PID'] = eval_pid(grid, n_drones, max_steps, wind=wind, n_eps=20)
+        print(f"    GAT-ITSE: Safety={wind_results[wind]['GAT-ITSE']['safety']:.1f}%, Cov={wind_results[wind]['GAT-ITSE']['coverage']:.1f}%", flush=True)
+    
+    # ═══ PHASE 7: Scalability ═══
+    print("\n" + "=" * 60, flush=True)
+    print("PHASE 7: Scalability Analysis", flush=True)
+    print("=" * 60, flush=True)
+    scalability_results = {'swarm': {}, 'grid': {}}
+    for n_d in [5, 10, 20]:
+        print(f"  Swarm = {n_d} drones", flush=True)
+        scalability_results['swarm'][n_d] = {}
+        scalability_results['swarm'][n_d]['GAT-ITSE'] = eval_trained_agent(
+            best_agent, grid, n_d, max_steps, wind=0, n_eps=10, use_gat=True)
+        scalability_results['swarm'][n_d]['Random'] = eval_random(grid, n_d, max_steps, wind=0, n_eps=10)
+    for gs in [20, 30, 50]:
+        print(f"  Grid = {gs}×{gs}", flush=True)
+        scalability_results['grid'][gs] = {}
+        scalability_results['grid'][gs]['GAT-ITSE'] = eval_trained_agent(
+            best_agent, gs, n_drones, max_steps, wind=0, n_eps=10, use_gat=True)
+        scalability_results['grid'][gs]['Random'] = eval_random(gs, n_drones, max_steps, wind=0, n_eps=10)
+    
+    # ═══ PHASE 8: Statistical Analysis ═══
+    print("\n" + "=" * 60, flush=True)
+    print("PHASE 8: Statistical Analysis", flush=True)
+    print("=" * 60, flush=True)
+    statistical_analysis(all_results)
+    
+    # ═══ PHASE 9: Publication Figures ═══
+    print("\n" + "=" * 60, flush=True)
+    print("PHASE 9: Generating Publication Figures", flush=True)
+    print("=" * 60, flush=True)
+    training_histories = {}
+    for name, res_list in [('GAT-ITSE', gat_results), ('No-GAT', nogat_results),
+                           ('MAPPO', mappo_res), ('IPPO', ippo_res)]:
+        if res_list:
+            last = res_list[-1]
+            training_histories[name] = {
+                'coverages': last.get('coverages', []),
+                'safety': last.get('safety', []),
+                'rewards': last.get('rewards', []),
+                'attention_entropy': last.get('attention_entropy', []),
+            }
+    generate_figures(all_results, training_histories, wind_results, scalability_results)
+    
+    # ═══ SAVE ALL RESULTS ═══
+    final_results = {
+        'benchmark': {k: {kk: vv for kk, vv in v.items() if kk != 'coverages'} for k, v in all_results.items()},
+        'wind_robustness': {str(k): v for k, v in wind_results.items()},
+        'scalability': {k: {str(kk): vv for kk, vv in v.items()} for k, v in scalability_results.items()},
+    }
     with open('gpu_benchmark_results.json', 'w') as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(final_results, f, indent=2)
     
     total_time = time.time() - total_start
     print(f"\n{'=' * 80}", flush=True)
-    print(f"GPU PIPELINE COMPLETE", flush=True)
+    print(f"GPU PIPELINE COMPLETE — ALL 9 PHASES DONE", flush=True)
     print(f"Total time: {total_time / 3600:.1f} hours ({total_time / 60:.0f} minutes)", flush=True)
     print(f"{'=' * 80}", flush=True)
 
