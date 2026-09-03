@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 =================================================================
-PlumeGym-MARL: Research-Grade Training Pipeline (GPU) — v3
+PlumeGym-MARL: Research-Grade Training Pipeline (GPU) — v4
 =================================================================
 Upload to Kaggle. Set GPU runtime.
 
@@ -10,23 +10,26 @@ Research contributions:
   2. Shared exploration map — agents see union of all visited cells
   3. Information-theoretic reward shaping (fire front observation bonus)
   4. Overlap penalty + quadrant diversity for coordinated exploration
-  5. Ablation: GAT vs No-GAT vs MAPPO baseline
+  5. 5-method ablation: GAT-MARAHS vs No-GAT vs MAPPO vs IPPO vs No-Comm
   6. Wind robustness sweep (train wind=0, evaluate wind 5-25)
   7. Communication entropy analysis (GAT attention diversity)
-  8. Sample efficiency & exploration speed metrics
+  8. Communication graph topology (density, components, avg path)
+  9. Scalability analysis (5/10/20 drones + 20x20/30x30/50x50 grids)
+ 10. Sample efficiency & exploration speed metrics
+ 11. Contribution isolation ablation (shared map vs GAT vs both)
 
-Pipeline:
-  1. Train GAT-MARAHS × 2 seeds
-  2. Train No-GAT ablation × 2 seeds
-  3. Train MAPPO baseline × 2 seeds
-  4. Benchmark vs Random / Greedy / PID baselines (with 95% bootstrap CIs)
-  5. Wind sweep (5/10/15/20/25 m/s) with error bars
-  6. Generate 9 publication figures (training curves, benchmark CIs,
-     wind robustness, ablation, attention heatmap, exploration heatmap,
-     sample efficiency, radar chart)
-  7. Full statistical analysis (Mann-Whitney U, Cohen's d, effect sizes)
-
-Runtime: ~4 hours on Kaggle GPU (T4)
+Pipeline (10 phases, ~8.5 hrs on T4):
+  1. Train GAT-MARAHS × 5 seeds (500 eps each)
+  2. Train No-GAT ablation × 5 seeds
+  3. Train MAPPO baseline × 2 seeds (slower per-episode)
+  4. Train IPPO baseline × 5 seeds (Yu et al. 2021)
+  5. Train No-Comm ablation × 5 seeds (no GAT + no shared map)
+  6. Benchmark vs Random / Greedy / PID (with 95% bootstrap CIs)
+  7. Wind sweep (5/10/15/20/25 m/s) with error bars
+  8. Scalability: swarm size (5/10/20) + grid size (20/30/50)
+  9. Communication topology analysis (graph metrics + attention patterns)
+ 10. 13 publication figures + full statistical analysis
+     (Mann-Whitney U, Cohen's d, bootstrap CIs, effect sizes)
 """
 import numpy as np
 import torch
@@ -439,7 +442,7 @@ class FastGATPPO:
             h1 = F.relu(self.gat.norm1(self.gat.attn1(obs_t, adj) + self.gat.res1(obs_t)))
             h2, attn_w = self.gat.attn2(h1, adj, return_attn=True)
             # Compute entropy of attention weights (higher = more distributed communication)
-            attn_probs = F.softmax(attn_w.mean(dim=-1), dim=-1)
+            attn_probs = F.softmax(attn_w, dim=-1)
             attn_entropy = -(attn_probs * (attn_probs + 1e-8).log()).sum(dim=-1).mean().item()
             self.attn_entropy_log.append(attn_entropy)
             enhanced = torch.cat([obs_t, self.gat.output_proj(F.relu(self.gat.norm2(h2 + self.gat.res2(h1))))], dim=1)
@@ -911,6 +914,181 @@ def train_mappo_multi_seed(n_episodes, grid, n_drones, max_steps, seeds=[42, 123
 
 
 # ═══════════════════════════════════════════════════════════════
+# SECTION 5b: IPPO BASELINE (Yu et al. 2021)
+# ═══════════════════════════════════════════════════════════════
+
+def train_ippo(n_episodes=500, grid=30, n_drones=10, max_steps=300, seed=0):
+    """Independent PPO: each agent trains its own policy with NO shared critic
+    and NO communication. This is the standard MARL baseline from
+    'The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games' (Yu et al. 2021)."""
+    torch.manual_seed(seed); np.random.seed(seed)
+    print(f"\n{'='*60}", flush=True)
+    print(f"IPPO (Independent) | seed={seed} | {n_episodes} eps | {n_drones} drones | {grid}x{grid}", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    env = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+    obs_dim, act_dim = env.obs_dim, env.act_dim
+    # Each agent has its own policy + value head (no shared critic)
+    policies = [PPONetwork(obs_dim, act_dim).to(device) for _ in range(n_drones)]
+    optimizers = [torch.optim.Adam(p.parameters(), lr=3e-4) for p in policies]
+    schedulers = [torch.optim.lr_scheduler.CosineAnnealingLR(o, T_max=2000, eta_min=1e-5) for o in optimizers]
+
+    rewards_h, coverage_h, safety_h = [], [], []
+    best_r = -float('inf')
+    t0 = time.time()
+
+    try:
+        for ep in range(n_episodes):
+            obs = env.reset()
+            ep_r, ep_crashes = 0.0, 0
+            # Per-agent trajectories for independent GAE
+            agent_trajs = [[] for _ in range(n_drones)]
+
+            for step in range(max_steps):
+                am = np.array([env.drones[i]['alive'] for i in range(n_drones)])
+                if not am.any(): break
+                obs_t = torch.tensor(obs, dtype=torch.float32).to(device)
+                actions, lp_list, val_list = [], [], []
+                for i in range(n_drones):
+                    if not am[i]:
+                        actions.append(0); lp_list.append(0.0); val_list.append(0.0)
+                        continue
+                    logits, val = policies[i](obs_t[i:i+1])
+                    dist = torch.distributions.Categorical(logits=logits)
+                    a = dist.sample()
+                    actions.append(a.item())
+                    lp_list.append(dist.log_prob(a).item())
+                    val_list.append(val.item())
+
+                prev_visited = [set(env.drones[i]['visited']) for i in range(n_drones)]
+                obs_next, _, dones, infos = env.step(np.array(actions, dtype=np.int32))
+                shaped = np.zeros(n_drones, dtype=np.float32)
+                for i in range(n_drones):
+                    if not am[i]: continue
+                    fd = infos[i].get('fire_dist', 10.0)
+                    crashed = infos[i].get('crashed', False)
+                    shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, crashed, step, max_steps, grid)
+                    ep_r += shaped[i]
+                    if crashed: ep_crashes += 1
+                for i in range(n_drones):
+                    if am[i]:
+                        agent_trajs[i].append({
+                            'obs': torch.tensor(obs[i]), 'action': actions[i],
+                            'reward': shaped[i], 'done': float(dones[i]),
+                            'log_prob': lp_list[i], 'value': val_list[i]})
+                obs = obs_next
+                if all(dones): break
+
+            # Independent PPO update per agent
+            for i in range(n_drones):
+                traj = agent_trajs[i]
+                if len(traj) < 4: continue
+                n = len(traj)
+                # GAE for this single agent
+                advs = np.zeros(n, dtype=np.float32)
+                rets = np.zeros(n, dtype=np.float32)
+                gae = 0.0
+                for k in reversed(range(n)):
+                    nv = 0.0 if k == n-1 else traj[k+1]['value']
+                    nd = 1.0 if k == n-1 else traj[k+1]['done']
+                    delta = traj[k]['reward'] + 0.99*nv*(1-nd) - traj[k]['value']
+                    gae = delta + 0.99*0.95*(1-nd)*gae
+                    advs[k] = gae; rets[k] = gae + traj[k]['value']
+                ao = torch.stack([t['obs'] for t in traj]).to(device)
+                aa = torch.tensor([t['action'] for t in traj], dtype=torch.long).to(device)
+                aolp = torch.tensor([t['log_prob'] for t in traj], dtype=torch.float32).to(device)
+                aadv = torch.tensor(advs, dtype=torch.float32).to(device)
+                aret = torch.tensor(rets, dtype=torch.float32).to(device)
+                aadv = (aadv - aadv.mean()) / (aadv.std() + 1e-8)
+                for _ in range(6):
+                    perm = torch.randperm(n, device=device)
+                    for s in range(0, n, 512):
+                        idx = perm[s:s+512]
+                        _, nlp, ent, vp = policies[i].evaluate(ao[idx], aa[idx])
+                        ratio = torch.exp(nlp - aolp[idx])
+                        s1 = ratio * aadv[idx]
+                        s2 = torch.clamp(ratio, 0.8, 1.2) * aadv[idx]
+                        loss = -torch.min(s1, s2).mean() - 0.02*ent.mean() + 0.5*F.mse_loss(vp, aret[idx])
+                        optimizers[i].zero_grad(); loss.backward()
+                        nn.utils.clip_grad_norm_(policies[i].parameters(), 0.5)
+                        optimizers[i].step()
+                schedulers[i].step()
+
+            cov = len(env.total_cells_explored)/(grid*grid)*100
+            saf = (1.0 - ep_crashes/n_drones)*100
+            rewards_h.append(ep_r); coverage_h.append(cov); safety_h.append(saf)
+            if (ep+1) % 100 == 0:
+                avg_r = np.mean(rewards_h[-100:]); avg_cov = np.mean(coverage_h[-100:]); avg_saf = np.mean(safety_h[-100:])
+                elapsed = time.time() - t0
+                eps_per_sec = (ep+1)/elapsed
+                eta_min = (n_episodes-ep-1)/max(eps_per_sec,1e-6)/60.0
+                exp_speed = np.mean(np.diff(coverage_h[-100:])) if len(coverage_h) > 1 else 0
+                print(f"Ep {ep+1:5d}/{n_episodes} | R: {avg_r:7.1f} | Cov: {avg_cov:5.1f}% | Safe: {avg_saf:4.0f}% | Speed: {exp_speed:+.3f}%/ep | {eps_per_sec:.1f} ep/s | ETA {eta_min:.0f}m", flush=True)
+                if avg_r > best_r:
+                    best_r = avg_r
+                    for j, p in enumerate(policies):
+                        torch.save(p.state_dict(), f'ippo_s{seed}_agent{j}_best.pt')
+                # Validation
+                val_c, val_s = [], []
+                for _ in range(3):
+                    ve = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+                    vo = ve.reset(); vc = 0
+                    for _ in range(max_steps):
+                        va = np.array([ve.drones[j]['alive'] for j in range(n_drones)])
+                        if not va.any(): break
+                        vt = torch.tensor(vo, dtype=torch.float32).to(device)
+                        vacts = np.zeros(n_drones, dtype=np.int32)
+                        for vi in range(n_drones):
+                            if not va[vi]: continue
+                            vlogits, _ = policies[vi](vt[vi:vi+1])
+                            vacts[vi] = torch.distributions.Categorical(logits=vlogits).sample().item()
+                        vo, _, vd, _ = ve.step(vacts)
+                        for j in range(n_drones):
+                            if va[j] and vd[j] and not ve.drones[j]['alive']: vc += 1
+                        if all(vd): break
+                    val_c.append(len(ve.total_cells_explored)/(grid*grid)*100)
+                    val_s.append((1.0-vc/n_drones)*100)
+                print(f"         VAL | Cov: {np.mean(val_c):5.1f}% +/- {np.std(val_c):4.1f} | Safe: {np.mean(val_s):4.0f}%", flush=True)
+    except (KeyboardInterrupt, SystemExit, Exception) as e:
+        print(f"\nTraining interrupted at ep {ep+1}: {e}", flush=True)
+
+    for j, p in enumerate(policies):
+        torch.save(p.state_dict(), f'ippo_s{seed}_agent{j}_final.pt')
+    results = {
+        'n_episodes': len(rewards_h), 'seed': seed, 'use_gat': False,
+        'final_reward': float(np.mean(rewards_h[-100:])) if len(rewards_h) >= 100 else float(np.mean(rewards_h)),
+        'final_coverage': float(np.mean(coverage_h[-100:])) if len(coverage_h) >= 100 else float(np.mean(coverage_h)),
+        'final_safety': float(np.mean(safety_h[-100:])) if len(safety_h) >= 100 else float(np.mean(safety_h)),
+        'rewards': [float(x) for x in rewards_h],
+        'coverages': [float(x) for x in coverage_h],
+        'safety': [float(x) for x in safety_h],
+    }
+    with open(f'ippo_s{seed}_training_results.json', 'w') as f: json.dump(results, f, indent=2)
+    print(f"\nDone in {time.time()-t0:.0f}s | Reward: {results['final_reward']:.1f} | Coverage: {results['final_coverage']:.1f}% | Safety: {results['final_safety']:.0f}%", flush=True)
+    return policies, results
+
+
+def train_ippo_multi_seed(n_episodes, grid, n_drones, max_steps, seeds=[42, 123]):
+    all_results = []
+    all_policies = []
+    for i, seed in enumerate(seeds):
+        print(f"\n{'#'*60}", flush=True)
+        print(f"# IPPO Run {i+1}/{len(seeds)} | seed={seed}", flush=True)
+        print(f"{'#'*60}", flush=True)
+        pols, res = train_ippo(n_episodes, grid, n_drones, max_steps, seed=seed)
+        all_results.append(res)
+        all_policies.append(pols)
+    covs = [r['final_coverage'] for r in all_results]
+    safes = [r['final_safety'] for r in all_results]
+    print(f"\n{'='*60}", flush=True)
+    print(f"IPPO | {len(seeds)} seeds:", flush=True)
+    print(f"  Coverage: {np.mean(covs):.1f}% +/- {np.std(covs):.1f}%", flush=True)
+    print(f"  Safety:   {np.mean(safes):.1f}% +/- {np.std(safes):.1f}%", flush=True)
+    print(f"{'='*60}", flush=True)
+    return all_policies, all_results
+
+
+# ═══════════════════════════════════════════════════════════════
 # SECTION 6: BENCHMARK
 # ═══════════════════════════════════════════════════════════════
 
@@ -1037,10 +1215,299 @@ def wind_sweep(agent, grid=30, n_drones=10, max_steps=300, n_eps=15):
 
 
 # ═══════════════════════════════════════════════════════════════
+# SECTION 7b: SCALABILITY ANALYSIS
+# ═══════════════════════════════════════════════════════════════
+
+def scalability_test(agent, grid=30, max_steps=300, n_eps=10):
+    """Evaluate GAT-MARAHS across different swarm sizes to demonstrate
+    scaling properties — essential for claiming 'multi-agent' contribution."""
+    print(f"\n{'='*60}\nSCALABILITY TEST | grid={grid}x{grid} | {n_eps} eps each\n{'='*60}", flush=True)
+    results = {}
+    for n_drones in [5, 10, 20]:
+        s, c, p = [], [], []
+        for _ in range(n_eps):
+            env_s = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+            obs = env_s.reset()
+            for _ in range(max_steps):
+                am = np.array([env_s.drones[i]['alive'] for i in range(n_drones)])
+                pos = np.array([env_s.drones[i]['pos'] for i in range(n_drones)], dtype=np.float32)
+                if not am.any(): break
+                acts, _, _, _ = agent.select_actions(obs, pos, am)
+                obs, _, dones, _ = env_s.step(np.array(acts, dtype=np.int32))
+                if all(dones): break
+            ac = sum(1 for i in range(n_drones) if env_s.drones[i]['alive'])
+            s.append(ac/n_drones*100)
+            c.append(len(env_s.total_cells_explored)/(grid*grid)*100)
+            fc = np.argwhere(env_s.fire > 0.2); pc = set()
+            for fx, fy in fc:
+                for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                    nx, ny = fx+dx, fy+dy
+                    if 0<=nx<grid and 0<=ny<grid and env_s.fire[nx,ny]<0.1: pc.add((nx,ny))
+            vis = set()
+            for i in range(n_drones): vis.update(env_s.drones[i].get('visited', set()))
+            p.append(len(pc & vis)/max(1,len(pc))*100)
+        s_ci = bootstrap_ci(np.array(s))
+        c_ci = bootstrap_ci(np.array(c))
+        results[str(n_drones)] = {
+            'safety': np.mean(s), 'coverage': np.mean(c), 'perimeter': np.mean(p),
+            'safety_ci': [float(s_ci[1]), float(s_ci[2])],
+            'coverage_ci': [float(c_ci[1]), float(c_ci[2])],
+        }
+        print(f"  {n_drones} drones: Safety={np.mean(s):5.1f}% | Coverage={np.mean(c):5.1f}% | Perimeter={np.mean(p):5.1f}%", flush=True)
+    with open('scalability_results.json', 'w') as f: json.dump(results, f, indent=2)
+    return results
+
+
+def grid_scalability_test(agent, n_drones=10, max_steps=300, n_eps=10):
+    """Evaluate across different grid sizes to show environment generalization."""
+    print(f"\n{'='*60}\nGRID SCALABILITY | {n_drones} drones | {n_eps} eps each\n{'='*60}", flush=True)
+    results = {}
+    for grid in [20, 30, 50]:
+        s, c = [], []
+        for _ in range(n_eps):
+            env_g = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+            obs = env_g.reset()
+            for _ in range(max_steps):
+                am = np.array([env_g.drones[i]['alive'] for i in range(n_drones)])
+                pos = np.array([env_g.drones[i]['pos'] for i in range(n_drones)], dtype=np.float32)
+                if not am.any(): break
+                acts, _, _, _ = agent.select_actions(obs, pos, am)
+                obs, _, dones, _ = env_g.step(np.array(acts, dtype=np.int32))
+                if all(dones): break
+            ac = sum(1 for i in range(n_drones) if env_g.drones[i]['alive'])
+            s.append(ac/n_drones*100)
+            c.append(len(env_g.total_cells_explored)/(grid*grid)*100)
+        results[str(grid)] = {'safety': np.mean(s), 'coverage': np.mean(c), 'grid': grid}
+        print(f"  Grid {grid}x{grid}: Safety={np.mean(s):5.1f}% | Coverage={np.mean(c):5.1f}%", flush=True)
+    with open('grid_scalability_results.json', 'w') as f: json.dump(results, f, indent=2)
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 7c: COMMUNICATION GRAPH TOPOLOGY ANALYSIS
+# ═══════════════════════════════════════════════════════════════
+
+def communication_analysis(agent, grid=30, n_drones=10, max_steps=300, n_eps=5):
+    """Analyze the learned communication topology — what structure
+    emerges from the GAT attention? This is the novelty analysis."""
+    print(f"\n{'='*60}\nCOMMUNICATION TOPOLOGY ANALYSIS\n{'='*60}", flush=True)
+    all_attn = []
+    all_adj_density = []
+    all_components = []
+    all_avg_path = []
+
+    for ep_i in range(n_eps):
+        env_c = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+        obs = env_c.reset()
+        for step in range(max_steps):
+            am = np.array([env_c.drones[i]['alive'] for i in range(n_drones)])
+            pos = np.array([env_c.drones[i]['pos'] for i in range(n_drones)], dtype=np.float32)
+            if not am.any(): break
+            obs_t = torch.tensor(obs, dtype=torch.float32).to(device)
+            pos_t = torch.tensor(pos, dtype=torch.float32).to(device)
+            alive_t = torch.tensor(am, dtype=torch.bool).to(device)
+            n_alive = int(am.sum())
+            if n_alive < 2: break
+            # Build adjacency and get attention
+            adj = agent.gat.build_graph(pos_t, alive_t)
+            adj_np = adj.cpu().numpy().astype(float)
+            all_adj_density.append(adj_np.sum() / max(1, n_alive*(n_alive-1)))
+            # Count connected components via BFS
+            visited = [False]*n_alive
+            n_comp = 0
+            for start in range(n_alive):
+                if not visited[start]:
+                    n_comp += 1
+                    queue = [start]
+                    visited[start] = True
+                    while queue:
+                        node = queue.pop(0)
+                        for nb in range(n_alive):
+                            if adj_np[node, nb] > 0 and not visited[nb]:
+                                visited[nb] = True
+                                queue.append(nb)
+            all_components.append(n_comp)
+            # Average shortest path (only if connected)
+            if n_comp == 1 and n_alive <= 20:
+                # BFS from each node
+                path_lens = []
+                for src in range(n_alive):
+                    dist = [-1]*n_alive; dist[src] = 0
+                    queue = [src]
+                    while queue:
+                        node = queue.pop(0)
+                        for nb in range(n_alive):
+                            if adj_np[node, nb] > 0 and dist[nb] == -1:
+                                dist[nb] = dist[node] + 1
+                                queue.append(nb)
+                    path_lens.extend([d for d in dist if d > 0])
+                if path_lens: all_avg_path.append(np.mean(path_lens))
+            # Attention weights: compute via GAT forward pass
+            try:
+                obs_t2 = torch.tensor(obs, dtype=torch.float32).to(device)
+                pos_t2 = torch.tensor(pos, dtype=torch.float32).to(device)
+                alive_t2 = torch.tensor(am, dtype=torch.bool).to(device)
+                adj2 = agent.gat.build_graph(pos_t2, alive_t2)
+                h1_2 = F.relu(agent.gat.norm1(agent.gat.attn1(obs_t2, adj2) + agent.gat.res1(obs_t2)))
+                _, attn_w2 = agent.gat.attn2(h1_2, adj2, return_attn=True)
+                if attn_w2 is not None and attn_w2.ndim == 2:
+                    # attn_w2 is (K, K) — apply softmax for proper distribution
+                    attn_np = F.softmax(attn_w2, dim=-1).detach().cpu().numpy()
+                    all_attn.append(attn_np)  # store full matrix (K, K)
+            except Exception:
+                pass
+            obs, _, dones, _ = env_c.step(agent.select_actions(obs, pos, am)[0])
+            if all(dones): break
+
+    if all_attn:
+        # Pad all attention matrices to n_drones x n_drones for averaging
+        max_k = n_drones
+        padded = []
+        for a in all_attn:
+            k = a.shape[0]
+            if k == max_k:
+                padded.append(a)
+            else:
+                pad = np.zeros((max_k, max_k), dtype=a.dtype)
+                pad[:k, :k] = a
+                padded.append(pad)
+        avg_attn = np.mean(padded, axis=0)
+        # Attention entropy per agent
+        attn_entropies = []
+        for a in all_attn:
+            k = a.shape[0]
+            if k < 2: continue
+            for row in a:
+                p = row / (row.sum() + 1e-8)
+                p = p[p > 1e-8]
+                if len(p) > 0: attn_entropies.append(-np.sum(p * np.log(p)))
+        print(f"  Avg adjacency density: {np.mean(all_adj_density):.3f} (fraction of possible edges)", flush=True)
+        print(f"  Avg connected components: {np.mean(all_components):.2f} (1.0 = fully connected)", flush=True)
+        if all_avg_path: print(f"  Avg shortest path length: {np.mean(all_avg_path):.2f}", flush=True)
+        if attn_entropies: print(f"  Avg attention entropy: {np.mean(attn_entropies):.3f} (max={np.log(n_drones):.2f} for uniform)", flush=True)
+        # Per-agent attention distribution
+        for i in range(min(n_drones, avg_attn.shape[0])):
+            top3 = np.argsort(avg_attn[i])[-3:][::-1]
+            print(f"    Agent {i} top-3 targets: {top3.tolist()} (weights: {avg_attn[i, top3].round(3).tolist()})", flush=True)
+    else:
+        print("  Warning: no attention data collected", flush=True)
+
+    comm_data = {
+        'adj_density': float(np.mean(all_adj_density)) if all_adj_density else 0,
+        'connected_components': float(np.mean(all_components)) if all_components else 0,
+        'avg_path_length': float(np.mean(all_avg_path)) if all_avg_path else 0,
+        'attention_entropy': float(np.mean(attn_entropies)) if all_attn else 0,
+    }
+    with open('communication_analysis.json', 'w') as f: json.dump(comm_data, f, indent=2)
+    return comm_data
+
+
+# ═══════════════════════════════════════════════════════════════
+# SECTION 7d: CONTRIBUTION ISOLATION ABLATION
+# ═══════════════════════════════════════════════════════════════
+
+def train_nocomm(n_episodes=500, grid=30, n_drones=10, max_steps=300, seed=0):
+    """No-Comm ablation: MLP-based processing with NO GAT and NO shared
+    exploration map. Isolates the contribution of each component."""
+    torch.manual_seed(seed); np.random.seed(seed)
+    print(f"\n{'='*60}", flush=True)
+    print(f"No-Comm (No GAT + No Shared Map) | seed={seed} | {n_episodes} eps", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    # Override: disable shared map in environment
+    env = WildfireEnv(grid=grid, n_drones=n_drones, max_steps=max_steps, wind_speed=0)
+    agent = FastGATPPO(obs_dim=env.obs_dim, act_dim=env.act_dim, use_gat=False)
+
+    rewards_h, coverage_h, safety_h = [], [], []
+    best_r = -float('inf')
+    early_stop_counter = 0
+    t0 = time.time()
+
+    try:
+        for ep in range(n_episodes):
+            obs = env.reset()
+            # Zero out shared exploration map at every step to simulate no-shared-map
+            env.shared_visited[:] = 0.0
+            agent._traj.clear()
+            ep_r, ep_crashes = 0.0, 0
+
+            for step in range(max_steps):
+                am = np.array([env.drones[i]['alive'] for i in range(n_drones)])
+                pos = np.array([env.drones[i]['pos'] for i in range(n_drones)], dtype=np.float32)
+                if not am.any(): break
+                actions, log_probs, values, enhanced = agent.select_actions(obs, pos, am)
+                prev_visited = [set(env.drones[i]['visited']) for i in range(n_drones)]
+                env.shared_visited[:] = 0.0  # zero BEFORE step
+                obs_next, _, dones, infos = env.step(np.array(actions, dtype=np.int32))
+                # Zero shared channel in obs_next (step() sets shared_visited internally)
+                obs_next[:, 4*81:5*81] = 0.0
+                shaped = np.zeros(n_drones, dtype=np.float32)
+                for i in range(n_drones):
+                    if not am[i]: continue
+                    fd = infos[i].get('fire_dist', 10.0)
+                    crashed = infos[i].get('crashed', False)
+                    shaped[i] = compute_reward(env.drones[i], i, env.drones, prev_visited[i], fd, crashed, step, max_steps, grid)
+                    ep_r += shaped[i]
+                    if crashed: ep_crashes += 1
+                agent_ids = list(range(n_drones))
+                agent.store(enhanced, actions, shaped, dones.astype(np.float32), log_probs, values, agent_ids)
+                obs = obs_next
+                if all(dones): break
+
+            agent.update()
+            cov = len(env.total_cells_explored)/(grid*grid)*100
+            saf = (1.0 - ep_crashes/n_drones)*100
+            rewards_h.append(ep_r); coverage_h.append(cov); safety_h.append(saf)
+            if (ep+1) % 100 == 0:
+                avg_r = np.mean(rewards_h[-100:]); avg_cov = np.mean(coverage_h[-100:]); avg_saf = np.mean(safety_h[-100:])
+                elapsed = time.time() - t0
+                eps_per_sec = (ep+1)/elapsed
+                eta_min = (n_episodes-ep-1)/max(eps_per_sec,1e-6)/60.0
+                print(f"Ep {ep+1:5d}/{n_episodes} | R: {avg_r:7.1f} | Cov: {avg_cov:5.1f}% | Safe: {avg_saf:4.0f}% | {eps_per_sec:.1f} ep/s | ETA {eta_min:.0f}m", flush=True)
+                if avg_r > best_r:
+                    best_r = avg_r
+                    agent.save(f'nocomm_s{seed}_best.pt')
+                if avg_cov >= 65.0: early_stop_counter += 100
+                else: early_stop_counter = 0
+                if early_stop_counter >= 300: break
+    except Exception as e:
+        print(f"\nTraining interrupted at ep {ep+1}: {e}", flush=True)
+
+    agent.save(f'nocomm_s{seed}_final.pt')
+    results = {
+        'n_episodes': len(rewards_h), 'seed': seed, 'use_gat': False,
+        'final_reward': float(np.mean(rewards_h[-100:])) if len(rewards_h) >= 100 else float(np.mean(rewards_h)),
+        'final_coverage': float(np.mean(coverage_h[-100:])) if len(coverage_h) >= 100 else float(np.mean(coverage_h)),
+        'final_safety': float(np.mean(safety_h[-100:])) if len(safety_h) >= 100 else float(np.mean(safety_h)),
+        'rewards': [float(x) for x in rewards_h],
+        'coverages': [float(x) for x in coverage_h],
+        'safety': [float(x) for x in safety_h],
+    }
+    with open(f'nocomm_s{seed}_results.json', 'w') as f: json.dump(results, f, indent=2)
+    print(f"\nDone in {time.time()-t0:.0f}s | Coverage: {results['final_coverage']:.1f}% | Safety: {results['final_safety']:.0f}%", flush=True)
+    return agent, results
+
+
+def train_nocomm_multi_seed(n_episodes, grid, n_drones, max_steps, seeds=[42, 123]):
+    all_results = []
+    for i, seed in enumerate(seeds):
+        print(f"\n{'#'*60}", flush=True)
+        print(f"# No-Comm Run {i+1}/{len(seeds)} | seed={seed}", flush=True)
+        print(f"{'#'*60}", flush=True)
+        agent, res = train_nocomm(n_episodes, grid, n_drones, max_steps, seed=seed)
+        all_results.append(res)
+    covs = [r['final_coverage'] for r in all_results]
+    print(f"\nNo-Comm | {len(seeds)} seeds: Coverage={np.mean(covs):.1f}% +/- {np.std(covs):.1f}%", flush=True)
+    return None, all_results
+
+
+# ═══════════════════════════════════════════════════════════════
 # SECTION 8: FIGURES
 # ═══════════════════════════════════════════════════════════════
 
-def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=None, grid=30, n_drones=10, max_steps=300):
+def generate_figures(gat_res, nogat_res, mappo_res, ippo_res=None, nocomm_res=None,
+                     bench=None, wind_res=None, scalability_res=None, grid_scalability_res=None,
+                     gat_agent=None, grid=30, n_drones=10, max_steps=300):
     import matplotlib; matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     os.makedirs('figures_gat', exist_ok=True)
@@ -1051,10 +1518,13 @@ def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=N
 
     # Fig 1: Training curves
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    colors = {'GAT-MARAHS': '#3498db', 'No-GAT': '#95a5a6', 'MAPPO': '#e74c3c'}
+    colors = {'GAT-MARAHS': '#3498db', 'No-GAT': '#95a5a6', 'MAPPO': '#e74c3c', 'IPPO': '#2ecc71', 'No-Comm': '#9b59b6'}
+    all_method_data = [('GAT-MARAHS', gat_res, '-'), ('No-GAT', nogat_res, '--'), ('MAPPO', mappo_res, ':')]
+    if ippo_res: all_method_data.append(('IPPO', ippo_res, '-.'))
+    if nocomm_res: all_method_data.append(('No-Comm', nocomm_res, (0, (3, 3))))
     for ax_i, (metric, label) in enumerate([('coverages', 'Coverage (%)'), ('safety', 'Safety (%)'), ('rewards', 'Reward')]):
         ax = axes[ax_i//2][ax_i%2]
-        for all_res, name, ls in [(gat_res, 'GAT-MARAHS', '-'), (nogat_res, 'No-GAT', '--'), (mappo_res, 'MAPPO', ':')]:
+        for name, all_res, ls in all_method_data:
             curves = [smooth(r[metric]) for r in all_res if len(r[metric]) > 20]
             if curves:
                 ml = min(len(cu) for cu in curves)
@@ -1067,8 +1537,8 @@ def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=N
         ax.legend(); ax.grid(True, alpha=0.3)
     # Summary bar
     ax = axes[1][1]
-    methods = ['GAT-MARAHS', 'No-GAT', 'MAPPO']
-    all_rs = [gat_res, nogat_res, mappo_res]
+    methods = [m for m, _, _ in all_method_data]
+    all_rs = [r for _, r, _ in all_method_data]
     covs = [np.mean([r['final_coverage'] for r in ar]) for ar in all_rs]
     safes = [np.mean([r['final_safety'] for r in ar]) for ar in all_rs]
     cerrs = [np.std([r['final_coverage'] for r in ar]) for ar in all_rs]
@@ -1132,7 +1602,8 @@ def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=N
             adj = gat_agent.gat.build_graph(pos_t, alive_t)
             h1 = F.relu(gat_agent.gat.norm1(gat_agent.gat.attn1(obs_t, adj) + gat_agent.gat.res1(obs_t)))
             _, attn_w = gat_agent.gat.attn2(h1, adj, return_attn=True)
-            attn_np = attn_w.mean(dim=-1).detach().cpu().numpy()
+            # attn_w is already (K, K) — just softmax to get proper distribution
+            attn_np = F.softmax(attn_w, dim=-1).detach().cpu().numpy()
             n_a = attn_np.shape[0]
             fig, ax = plt.subplots(figsize=(6, 5))
             im = ax.imshow(attn_np, cmap='YlOrRd', vmin=0)
@@ -1148,8 +1619,10 @@ def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=N
     # Fig 6: Sample efficiency — episodes to reach coverage thresholds
     fig, ax = plt.subplots(figsize=(8, 5))
     thresholds = np.arange(5, 80, 5)
-    colors_se = {'GAT-MARAHS': '#3498db', 'No-GAT': '#95a5a6', 'MAPPO': '#e74c3c'}
-    for all_res, name, ls in [(gat_res, 'GAT-MARAHS', '-'), (nogat_res, 'No-GAT', '--'), (mappo_res, 'MAPPO', ':')]:
+    se_methods = [('GAT-MARAHS', gat_res, '-'), ('No-GAT', nogat_res, '--'), ('MAPPO', mappo_res, ':')]
+    if ippo_res: se_methods.append(('IPPO', ippo_res, '-.'))
+    if nocomm_res: se_methods.append(('No-Comm', nocomm_res, (0, (3, 3))))
+    for name, all_res, ls in se_methods:
         frac_at_t = []
         for t in thresholds:
             count = 0
@@ -1159,7 +1632,7 @@ def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=N
                     idx = np.where(cov_curve >= t)[0]
                     if len(idx) > 0: count += 1
             frac_at_t.append(count / max(1, len(all_res)))
-        ax.plot(thresholds, frac_at_t, ls, color=colors_se[name], lw=2, label=name, marker='o', markersize=3)
+        ax.plot(thresholds, frac_at_t, ls, color=colors[name], lw=2, label=name, marker='o', markersize=3)
     ax.set_xlabel('Coverage Threshold (%)')
     ax.set_ylabel('Fraction of Seeds Achieved')
     ax.set_title('(f) Sample Efficiency')
@@ -1247,7 +1720,90 @@ def generate_figures(gat_res, nogat_res, mappo_res, bench, wind_res, gat_agent=N
     ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
     plt.tight_layout(); plt.savefig('figures_gat/fig9_radar.png', bbox_inches='tight'); plt.close()
 
-    print("  ✓ 9 figures saved to figures_gat/", flush=True)
+    # Fig 10: Scalability — coverage vs swarm size
+    if scalability_res:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ns = sorted([int(k) for k in scalability_res.keys()])
+        covs = [scalability_res[str(n)]['coverage'] for n in ns]
+        safes = [scalability_res[str(n)]['safety'] for n in ns]
+        c_ci_lo = [scalability_res[str(n)].get('coverage_ci', [0,0])[0] for n in ns]
+        c_ci_hi = [scalability_res[str(n)].get('coverage_ci', [0,0])[1] for n in ns]
+        ax.errorbar(ns, covs, yerr=[np.array(covs)-np.array(c_ci_lo), np.array(c_ci_hi)-np.array(covs)],
+                    marker='o', lw=2, color='#3498db', capsize=5, label='Coverage', fmt='-o')
+        ax.errorbar(ns, safes, marker='s', lw=2, color='#2ecc71', capsize=5, label='Safety', fmt='-s')
+        ax.set_xlabel('Number of Drones'); ax.set_ylabel('Performance (%)')
+        ax.set_title('GAT-MARAHS Scalability'); ax.legend(); ax.grid(True, alpha=0.3); ax.set_ylim(0, 100)
+        ax.set_xticks(ns)
+        plt.tight_layout(); plt.savefig('figures_gat/fig10_scalability.png'); plt.close()
+
+    # Fig 11: Contribution isolation — ablation bar chart
+    fig, ax = plt.subplots(figsize=(8, 5))
+    abl_methods = ['GAT-MARAHS', 'No-GAT', 'MAPPO']
+    abl_rs = [gat_res, nogat_res, mappo_res]
+    abl_colors = ['#3498db', '#95a5a6', '#e74c3c']
+    if ippo_res:
+        abl_methods.append('IPPO'); abl_rs.append(ippo_res); abl_colors.append('#2ecc71')
+    if nocomm_res:
+        abl_methods.append('No-Comm'); abl_rs.append(nocomm_res); abl_colors.append('#9b59b6')
+    abl_covs = [np.mean([r['final_coverage'] for r in ar]) for ar in abl_rs]
+    abl_cov_errs = [np.std([r['final_coverage'] for r in ar]) for ar in abl_rs]
+    abl_safs = [np.mean([r['final_safety'] for r in ar]) for ar in abl_rs]
+    abl_saf_errs = [np.std([r['final_safety'] for r in ar]) for ar in abl_rs]
+    x = np.arange(len(abl_methods)); w = 0.35
+    ax.bar(x-w/2, abl_covs, w, yerr=abl_cov_errs, capsize=5, label='Coverage', color=abl_colors, edgecolor='k', lw=0.5, alpha=0.85)
+    ax.bar(x+w/2, abl_safs, w, yerr=abl_saf_errs, capsize=5, label='Safety', color=abl_colors, edgecolor='k', lw=0.5, alpha=0.5)
+    ax.set_xticks(x); ax.set_xticklabels(abl_methods, rotation=15)
+    ax.set_ylabel('Performance (%)'); ax.set_title('Contribution Isolation Ablation')
+    ax.legend(); ax.grid(True, axis='y', alpha=0.3); ax.set_ylim(0, 100)
+    plt.tight_layout(); plt.savefig('figures_gat/fig11_contribution_ablation.png'); plt.close()
+
+    # Fig 12: Grid scalability — coverage vs grid size
+    if grid_scalability_res:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        grids = sorted([int(k) for k in grid_scalability_res.keys()])
+        gs_covs = [grid_scalability_res[str(g)]['coverage'] for g in grids]
+        gs_safs = [grid_scalability_res[str(g)]['safety'] for g in grids]
+        ax.plot(grids, gs_covs, '-o', color='#3498db', lw=2, label='Coverage')
+        ax.plot(grids, gs_safs, '-s', color='#2ecc71', lw=2, label='Safety')
+        ax.set_xlabel('Grid Size'); ax.set_ylabel('Performance (%)')
+        ax.set_title('GAT-MARAHS Environment Generalization')
+        ax.legend(); ax.grid(True, alpha=0.3); ax.set_ylim(0, 100)
+        ax.set_xticks(grids)
+        plt.tight_layout(); plt.savefig('figures_gat/fig12_grid_scalability.png'); plt.close()
+
+    # Fig 13: Updated radar chart with all methods
+    fig, ax = plt.subplots(figsize=(9, 9), subplot_kw=dict(polar=True))
+    radar_metrics = ['Coverage', 'Safety', 'Perimeter', 'Sample Eff.', 'Robustness']
+    n_metrics = len(radar_metrics)
+    angles = np.linspace(0, 2*np.pi, n_metrics, endpoint=False).tolist()
+    angles += angles[:1]
+    radar_methods = [('GAT-MARAHS', gat_res, '#3498db'), ('No-GAT', nogat_res, '#95a5a6'), ('MAPPO', mappo_res, '#e74c3c')]
+    if ippo_res: radar_methods.append(('IPPO', ippo_res, '#2ecc71'))
+    if nocomm_res: radar_methods.append(('No-Comm', nocomm_res, '#9b59b6'))
+    for name, all_res, color in radar_methods:
+        cov = np.mean([r['final_coverage'] for r in all_res])
+        saf = np.mean([r['final_safety'] for r in all_res])
+        perim = bench.get(name, {}).get('perimeter', bench.get('GAT-MARAHS', {}).get('perimeter', 0) if name == 'GAT-MARAHS' else 0)
+        se_scores = []
+        for r in all_res:
+            cov_smooth_arr = smooth(r['coverages'], 20)
+            idx = np.where(cov_smooth_arr >= 30)[0]
+            se_scores.append(idx[0] if len(idx) > 0 else len(cov_smooth_arr))
+        se = 100.0 / max(1, np.mean(se_scores))
+        rob = np.mean([wind_res[str(w)]['coverage'] for w in sorted([int(k) for k in wind_res.keys()])]) if wind_res else 0
+        values = [cov, saf, perim, se * 10, rob]
+        values = [min(100, max(0, v)) for v in values]
+        values += values[:1]
+        ax.plot(angles, values, 'o-', lw=2, label=name, color=color)
+        ax.fill(angles, values, alpha=0.08, color=color)
+    ax.set_xticks(angles[:-1]); ax.set_xticklabels(radar_metrics)
+    ax.set_ylim(0, 100)
+    ax.set_title('Multi-Method Comparison (Radar)', y=1.08)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1))
+    plt.tight_layout(); plt.savefig('figures_gat/fig13_radar_all.png', bbox_inches='tight'); plt.close()
+
+    n_figs = 9 + (1 if scalability_res else 0) + (1 if nocomm_res else 0) + (1 if grid_scalability_res else 0) + 1
+    print(f"  ✓ {n_figs} figures saved to figures_gat/", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1273,7 +1829,7 @@ def bootstrap_ci(data, n_boot=2000, ci=0.95):
     return np.mean(data), lo, hi
 
 
-def statistical_analysis(gat_res, nogat_res, mappo_res, bench_res, wind_res):
+def statistical_analysis(gat_res, nogat_res, mappo_res, bench_res, wind_res, ippo_res=None, nocomm_res=None):
     """Publication-ready statistical comparison between all methods.
     Reports: means, stds, 95% CIs, Mann-Whitney U p-values, Cohen's d.
     """
@@ -1286,6 +1842,8 @@ def statistical_analysis(gat_res, nogat_res, mappo_res, bench_res, wind_res):
         'No-GAT': nogat_res,
         'MAPPO': mappo_res,
     }
+    if ippo_res: methods['IPPO'] = ippo_res
+    if nocomm_res: methods['No-Comm'] = nocomm_res
 
     # --- 1. Training convergence comparison ---
     print("\n--- Training Convergence (final 100-episode windows) ---", flush=True)
@@ -1308,6 +1866,10 @@ def statistical_analysis(gat_res, nogat_res, mappo_res, bench_res, wind_res):
     # --- 2. Pairwise significance tests ---
     print("\n--- Pairwise Statistical Tests (Mann-Whitney U, two-sided) ---", flush=True)
     pairs = [('GAT-MARAHS', 'No-GAT'), ('GAT-MARAHS', 'MAPPO'), ('No-GAT', 'MAPPO')]
+    if ippo_res:
+        pairs.extend([('GAT-MARAHS', 'IPPO'), ('MAPPO', 'IPPO')])
+    if nocomm_res:
+        pairs.extend([('GAT-MARAHS', 'No-Comm'), ('No-GAT', 'No-Comm')])
     for m1, m2 in pairs:
         c1, c2 = covs_all[m1], covs_all[m2]
         if sp_stats is not None:
@@ -1467,58 +2029,84 @@ def _approx_normal_cdf(x):
 
 if __name__ == "__main__":
     print("="*60, flush=True)
-    print("PlumeGym-MARL: Research-Grade Training Pipeline (GPU) v2", flush=True)
+    print("PlumeGym-MARL: Research-Grade Training Pipeline (GPU) v4", flush=True)
     print("="*60, flush=True)
 
     GRID = 30
     N_DRONES = 10
     MAX_STEPS = 300
-    N_EPISODES = 800
-    SEEDS = [42, 123]
+    N_EPISODES = 500       # Reduced from 800: more seeds > more episodes for stats
+    SEEDS = [42, 123, 256, 789, 2024]  # 5 seeds for proper statistical power
+    MAPPO_SEEDS = [42, 123]  # 2 seeds for MAPPO (slower per-episode)
 
     t_total = time.time()
 
-    # Phase 1: GAT-MARAHS
+    # Phase 1: GAT-MARAHS (5 seeds)
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 1: Train GAT-MARAHS (2 seeds)", flush=True)
+    print(f"# PHASE 1: Train GAT-MARAHS ({len(SEEDS)} seeds)", flush=True)
     print("#"*60, flush=True)
     gat_agent, gat_all_res = train_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, use_gat=True, seeds=SEEDS)
 
-    # Phase 2: No-GAT ablation
+    # Phase 2: No-GAT ablation (5 seeds)
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 2: Train No-GAT ablation (2 seeds)", flush=True)
+    print(f"# PHASE 2: Train No-GAT ablation ({len(SEEDS)} seeds)", flush=True)
     print("#"*60, flush=True)
     nogat_agent, nogat_all_res = train_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, use_gat=False, seeds=SEEDS)
 
-    # Phase 3: MAPPO baseline
+    # Phase 3: MAPPO baseline (2 seeds — slower per-episode)
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 3: Train MAPPO baseline (2 seeds)", flush=True)
+    print(f"# PHASE 3: Train MAPPO baseline ({len(MAPPO_SEEDS)} seeds)", flush=True)
     print("#"*60, flush=True)
-    mappo_agent, mappo_all_res = train_mappo_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, seeds=SEEDS)
+    mappo_agent, mappo_all_res = train_mappo_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, seeds=MAPPO_SEEDS)
 
-    # Phase 4: Benchmark
+    # Phase 4: IPPO baseline (5 seeds)
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 4: Benchmark vs baselines", flush=True)
+    print(f"# PHASE 4: Train IPPO baseline ({len(SEEDS)} seeds)", flush=True)
+    print("#"*60, flush=True)
+    ippo_pols, ippo_all_res = train_ippo_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, seeds=SEEDS)
+
+    # Phase 5: No-Comm ablation (5 seeds — no GAT + no shared map)
+    print("\n" + "#"*60, flush=True)
+    print(f"# PHASE 5: Train No-Comm ablation ({len(SEEDS)} seeds)", flush=True)
+    print("#"*60, flush=True)
+    nocomm_agent, nocomm_all_res = train_nocomm_multi_seed(N_EPISODES, GRID, N_DRONES, MAX_STEPS, seeds=SEEDS)
+
+    # Phase 6: Benchmark (GAT vs Random/Greedy/PID, with 95% bootstrap CIs)
+    print("\n" + "#"*60, flush=True)
+    print("# PHASE 6: Benchmark vs baselines (wind=12)", flush=True)
     print("#"*60, flush=True)
     bench_res = benchmark(gat_agent, GRID, N_DRONES, MAX_STEPS, wind=12.0, n_eps=20)
 
-    # Phase 5: Wind sweep
+    # Phase 7: Wind robustness sweep
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 5: Wind robustness sweep", flush=True)
+    print("# PHASE 7: Wind robustness sweep", flush=True)
     print("#"*60, flush=True)
     wind_res = wind_sweep(gat_agent, GRID, N_DRONES, MAX_STEPS, n_eps=15)
 
-    # Phase 6: Figures
+    # Phase 8: Scalability (5/10/20 drones + 20x20/30x30/50x50 grids)
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 6: Generate publication figures", flush=True)
+    print("# PHASE 8: Scalability analysis", flush=True)
     print("#"*60, flush=True)
-    generate_figures(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_res, gat_agent, GRID, N_DRONES, MAX_STEPS)
+    scalability_res = scalability_test(gat_agent, grid=GRID, max_steps=MAX_STEPS, n_eps=10)
+    grid_scalability_res = grid_scalability_test(gat_agent, n_drones=N_DRONES, max_steps=MAX_STEPS, n_eps=10)
 
-    # Phase 7: Statistical analysis
+    # Phase 9: Communication topology analysis
     print("\n" + "#"*60, flush=True)
-    print("# PHASE 7: Statistical analysis & research metrics", flush=True)
+    print("# PHASE 9: Communication topology analysis", flush=True)
     print("#"*60, flush=True)
-    stat_report = statistical_analysis(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_res)
+    comm_data = communication_analysis(gat_agent, grid=GRID, n_drones=N_DRONES, max_steps=MAX_STEPS, n_eps=5)
+
+    # Phase 10: Figures + Statistical analysis
+    print("\n" + "#"*60, flush=True)
+    print("# PHASE 10: Publication figures & statistical analysis", flush=True)
+    print("#"*60, flush=True)
+    generate_figures(gat_all_res, nogat_all_res, mappo_all_res,
+                     ippo_res=ippo_all_res, nocomm_res=nocomm_all_res,
+                     bench=bench_res, wind_res=wind_res,
+                     scalability_res=scalability_res, grid_scalability_res=grid_scalability_res,
+                     gat_agent=gat_agent, grid=GRID, n_drones=N_DRONES, max_steps=MAX_STEPS)
+    stat_report = statistical_analysis(gat_all_res, nogat_all_res, mappo_all_res, bench_res, wind_res,
+                                       ippo_res=ippo_all_res, nocomm_res=nocomm_all_res)
 
     # Summary
     total_time = time.time() - t_total
@@ -1526,14 +2114,19 @@ if __name__ == "__main__":
     print("COMPLETE!", flush=True)
     print("="*60, flush=True)
     print(f"Total time: {total_time/60:.1f} min ({total_time/3600:.1f} hrs)", flush=True)
-    for label, all_res in [('GAT-MARAHS', gat_all_res), ('No-GAT', nogat_all_res), ('MAPPO', mappo_all_res)]:
-        print(f"\n{label} ({len(SEEDS)} seeds):", flush=True)
+    print(f"Seeds: GAT/NoGAT/IPPO/NoComm={len(SEEDS)}, MAPPO={len(MAPPO_SEEDS)}", flush=True)
+    print(f"Episodes per seed: {N_EPISODES}, Max steps: {MAX_STEPS}", flush=True)
+    all_methods = [('GAT-MARAHS', gat_all_res, len(SEEDS)), ('No-GAT', nogat_all_res, len(SEEDS)),
+                   ('MAPPO', mappo_all_res, len(MAPPO_SEEDS)), ('IPPO', ippo_all_res, len(SEEDS)),
+                   ('No-Comm', nocomm_all_res, len(SEEDS))]
+    for label, all_res, n_seeds in all_methods:
+        print(f"\n{label} ({n_seeds} seeds):", flush=True)
         print(f"  Coverage: {np.mean([r['final_coverage'] for r in all_res]):.1f}% +/- {np.std([r['final_coverage'] for r in all_res]):.1f}%", flush=True)
         print(f"  Safety:   {np.mean([r['final_safety'] for r in all_res]):.1f}% +/- {np.std([r['final_safety'] for r in all_res]):.1f}%", flush=True)
         if any(r.get('attention_entropy') for r in all_res):
             all_ent = np.concatenate([r['attention_entropy'][-100:] for r in all_res if r.get('attention_entropy')])
             if len(all_ent) > 0:
-                print(f"  Attn Entropy: {np.mean(all_ent):.3f} +/- {np.std(all_ent):.3f} (higher = more distributed)", flush=True)
+                print(f"  Attn Entropy: {np.mean(all_ent):.3f} +/- {np.std(all_ent):.3f} (higher=more distributed)", flush=True)
     print(f"\nBenchmark (wind=12):", flush=True)
     for m, v in bench_res.items():
         print(f"  {m}: Safety={v['safety']:.1f}% Coverage={v['coverage']:.1f}% Perimeter={v['perimeter']:.1f}%", flush=True)
@@ -1542,3 +2135,14 @@ if __name__ == "__main__":
         if str(w) in wind_res:
             r = wind_res[str(w)]
             print(f"  {w:2d} m/s: Safety={r['safety']:.1f}% Coverage={r['coverage']:.1f}% Perimeter={r['perimeter']:.1f}%", flush=True)
+    print(f"\nScalability:", flush=True)
+    for n in [5, 10, 20]:
+        if str(n) in scalability_res:
+            r = scalability_res[str(n)]
+            print(f"  {n} drones: Safety={r['safety']:.1f}% Coverage={r['coverage']:.1f}%", flush=True)
+    print(f"\nCommunication topology:", flush=True)
+    if comm_data:
+        print(f"  Adj density: {comm_data.get('adj_density', 0):.3f}", flush=True)
+        print(f"  Components: {comm_data.get('connected_components', 0):.2f}", flush=True)
+        print(f"  Avg path: {comm_data.get('avg_path_length', 0):.2f}", flush=True)
+        print(f"  Attn entropy: {comm_data.get('attention_entropy', 0):.3f}", flush=True)
