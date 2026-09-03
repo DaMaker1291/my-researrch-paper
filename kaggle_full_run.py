@@ -686,20 +686,32 @@ class GATCommunication(nn.Module):
         self.res1 = nn.Linear(in_dim, hidden_dim) if in_dim != hidden_dim else nn.Identity()
         self.res2 = nn.Linear(hidden_dim, out_dim)
 
-    def build_graph(self, positions, alive_mask):
+    def build_graph(self, positions, alive_mask, group=None):
+        """Vectorized comm-range adjacency — no per-pair Python loop / GPU sync.
+
+        Args:
+            positions: (K, 2) float tensor
+            alive_mask: (K,) bool tensor
+            group: optional (K,) int tensor; when given, edges are allowed only
+                between agents sharing the same group id (used by the batched
+                multi-env training path so agents in different parallel
+                environments never communicate with each other).
+        """
         K = len(positions)
-        adj = torch.zeros(K, K, dtype=torch.bool, device=device)
-        for i in range(K):
-            if not alive_mask[i]: continue
-            for j in range(K):
-                if not alive_mask[j] or i == j: continue
-                if torch.norm(positions[i] - positions[j]) < self.comm_range:
-                    adj[i, j] = adj[j, i] = True
-            adj[i, i] = True
+        d = positions[:, None, :] - positions[None, :, :]   # (K, K, 2)
+        d2 = (d * d).sum(-1)                                # (K, K)
+        adj = d2 < self.comm_range * self.comm_range
+        if group is not None:
+            adj = adj & (group[:, None] == group[None, :])
+        alive = alive_mask
+        adj = adj & alive[:, None] & alive[None, :]
+        eye = torch.arange(K, device=positions.device)
+        adj[eye, eye] = False
+        adj[eye, eye] = alive          # self-loop only for alive agents
         return adj
 
-    def forward(self, obs, positions, alive_mask, return_attn=False):
-        adj = self.build_graph(positions, alive_mask)
+    def forward(self, obs, positions, alive_mask, return_attn=False, group=None):
+        adj = self.build_graph(positions, alive_mask, group)
         h1 = F.relu(self.norm1(self.attn1(obs, adj) + self.res1(obs)))
         h2, attn2 = self.attn2(h1, adj, return_attn=True)
         h2 = F.relu(self.norm2(h2 + self.res2(h1)))
@@ -721,7 +733,7 @@ class NoGATCommunication(nn.Module):
         self._in_dim = in_dim
         self._out_dim = out_dim
 
-    def forward(self, obs, positions=None, alive_mask=None):
+    def forward(self, obs, positions=None, alive_mask=None, group=None):
         return torch.cat([obs, self.mlp(obs)], dim=1)
 
     @property

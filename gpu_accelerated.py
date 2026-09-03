@@ -66,7 +66,12 @@ class GPUWildfireEnv:
         self.obs_size = 2 * obs_r + 1  # 9
         self.obs_channels = 6  # fire, thermal, wind_x, wind_y, visited, fire_dist
         self.local_obs_dim = self.obs_channels * self.obs_size * self.obs_size
-        self.global_obs_dim = 10
+        # Global features: 10 scalar features + a small team-visited-map cue
+        # (6×6 downsampled fraction of cells the swarm has explored — gives the
+        # reactive policy the global memory it needs to sweep instead of re-scan).
+        self.global_base_dim = 10
+        self.map_cue_size = 6
+        self.global_obs_dim = self.global_base_dim + self.map_cue_size ** 2
         self.obs_dim = self.local_obs_dim + self.global_obs_dim
         self.act_dim = 5
         self.base_wind = wind_speed
@@ -246,28 +251,43 @@ class GPUWildfireEnv:
         self.thermal = self.thermal.clamp(0, self.thermal_cap)
     
     def _update_fire_dist(self):
-        """Vectorized fire distance computation on GPU."""
-        fire_mask = (self.fire > 0.2)  # (N, G, G)
-        has_fire = fire_mask.sum(dim=(1, 2)) > 0  # (N,)
+        """EXACT Euclidean distance to nearest fire cell, fully vectorized on GPU.
         
+        Two-pass separable Euclidean distance transform (the standard
+        Felzenszwalb–Huttenlocher decomposition), evaluated exactly over the
+        small G×G grid with batched min-plus ops. Each cell gets the true
+        Euclidean distance to the closest cell with fire > 0.2 in its own
+        environment — same semantics as the original argwhere loop, but with
+        no per-env Python loop and no GPU-CPU sync.
+        """
+        N, G = self.n_envs, self.grid
+        fire_mask = (self.fire > 0.2)  # (N, G, G)
         self.fire_dist.fill_(10.0)
         
-        # For each environment with fire, compute distance transform
-        for n in range(self.n_envs):
-            if not has_fire[n]:
-                continue
-            # Find fire cells
-            fire_cells = torch.argwhere(fire_mask[n])  # (M, 2)
-            if len(fire_cells) == 0:
-                continue
-            # Compute min distance from each cell to nearest fire cell
-            fy = fire_cells[:, 0].float()
-            fx = fire_cells[:, 1].float()
-            # Vectorized distance: (G, G, M) → min over M
-            dist_y = self.yy.unsqueeze(2) - fy.view(1, 1, -1)
-            dist_x = self.xx.unsqueeze(2) - fx.view(1, 1, -1)
-            dist = torch.sqrt(dist_x**2 + dist_y**2 + 1e-8)
-            self.fire_dist[n] = dist.min(dim=2)[0]
+        has_fire = fire_mask.any(dim=(1, 2))  # (N,)
+        if not has_fire.any():
+            return
+        
+        # Squared offset matrix (i - j)^2 for targets i and sources j
+        coords = torch.arange(G, device=device, dtype=torch.float32)
+        d2 = (coords[:, None] - coords[None, :]) ** 2  # (G, G)
+        INF = 1e8
+        
+        # ── Pass 1 along x (per row): gx[y,x] = min over fire cols j of (x-j)^2 ──
+        rows = fire_mask[has_fire].reshape(-1, G)      # (Nf*G, G)
+        cand = d2[None, :, :] + torch.where(rows[:, None, :], 0.0, INF)
+        gx = cand.min(dim=2).values                    # (Nf*G, G); INF if row has no fire
+        
+        # ── Pass 2 along y: for each column x, d2[y,x] = min over rows k of (y-k)^2 + gx[k,x] ──
+        Nf = int(has_fire.sum().item())
+        # cols: one series per (env, column x) over row index k → shape (Nf*G, G)
+        cols = gx.reshape(Nf, G, G).transpose(1, 2).reshape(Nf * G, G)
+        cand2 = d2[None, :, :] + cols[:, None, :]      # (Nf*G, G_y, G_k)
+        dist2 = cand2.min(dim=2).values                # (Nf*G, G): index (col x, row y)
+        # Pack as (Nf, col x, row y), then transpose back to (Nf, row y, col x)
+        dist2 = dist2.reshape(Nf, G, G).transpose(1, 2)
+        
+        self.fire_dist[has_fire] = torch.sqrt(dist2 + 1e-8)
     
     def _spread_fire(self):
         """Vectorized fire spread on GPU across all N environments."""
@@ -334,62 +354,60 @@ class GPUWildfireEnv:
         
         Returns:
             obs: (N, K, obs_dim) float tensor
-            rewards: (N, K) float tensor
             dones: (N, K) bool tensor
-            infos: dict with crash info
+            crashed: (N, K) bool tensor
         """
         self.step_count += 1
         N, G, K = self.n_envs, self.grid, self.n_drones
         
         # Get action deltas for all drones
         action_deltas = self.action_deltas[actions]  # (N, K, 2)
+        alive = self.drone_alive  # (N, K) — alive at start of this step
+        alive_e = alive.unsqueeze(-1)  # (N, K, 1)
         
-        # Update velocity with momentum
+        # Update velocity with momentum — dead drones stay frozen (vel 0, pos unchanged),
+        # matching the reference CPU env semantics (dead agents are skipped entirely).
         new_vel = self.momentum * self.drone_vel + (1 - self.momentum) * action_deltas
+        new_vel = torch.where(alive_e, new_vel, torch.zeros_like(new_vel))
         self.drone_vel = new_vel
         
-        # Update position
-        new_pos = self.drone_pos + new_vel
+        # Update position (only alive drones move)
+        new_pos = torch.where(alive_e, self.drone_pos + new_vel, self.drone_pos)
         new_pos = new_pos.clamp(self.boundary_margin, G - 1 - self.boundary_margin)
         self.drone_pos = new_pos
         
-        # Mark visited cells
-        px_int = new_pos[:, :, 0].long().clamp(0, G-1)
-        py_int = new_pos[:, :, 1].long().clamp(0, G-1)
+        # ── Mark visited cells (fully vectorized, no per-drone loop) ──
+        px_int = new_pos[:, :, 0].long().clamp(0, G-1)  # (N, K)
+        py_int = new_pos[:, :, 1].long().clamp(0, G-1)  # (N, K)
+        alive = self.drone_alive  # (N, K)
         
-        for i in range(K):
-            alive_mask = self.drone_alive[:, i]  # (N,)
-            env_idx = torch.arange(N, device=device)
-            valid = alive_mask
-            self.shared_visited[env_idx[valid], py_int[valid, i], px_int[valid, i]] = 1.0
-            self.total_cells_explored[env_idx[valid], py_int[valid, i], px_int[valid, i]] = True
+        env_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, K)  # (N, K)
+        env_flat = env_idx.reshape(-1)
+        px_flat = px_int.reshape(-1)
+        py_flat = py_int.reshape(-1)
+        alive_flat = alive.reshape(-1)
         
-        # Check crashes
-        dones = torch.zeros(N, K, dtype=torch.bool, device=device)
-        crashed = torch.zeros(N, K, dtype=torch.bool, device=device)
+        valid = alive_flat
+        self.shared_visited[env_flat[valid], py_flat[valid], px_flat[valid]] = 1.0
+        self.total_cells_explored[env_flat[valid], py_flat[valid], px_flat[valid]] = True
         
-        for i in range(K):
-            alive = self.drone_alive[:, i]  # (N,)
-            if not alive.any():
-                continue
-            ix = px_int[:, i].clamp(0, G-1)
-            iy = py_int[:, i].clamp(0, G-1)
-            env_idx = torch.arange(N, device=device)
-            
-            # Fire crash
-            fire_val = self.fire[env_idx, iy, ix]
-            fire_near = self.fire_dist[env_idx, iy, ix]
-            thermal_val = self.thermal[env_idx, iy, ix]
-            
-            crash_mask = alive & (
-                (fire_val > self.fire_crash_threshold) |
-                (fire_near < 0.5) |
-                (thermal_val > self.thermal_crash)
-            )
-            
-            crashed[:, i] = crash_mask
-            self.drone_alive[:, i] = ~crash_mask
-            dones[:, i] = crash_mask | ~alive
+        # ── Check crashes (fully vectorized, no per-drone loop) ──
+        ix_all = px_int.clamp(0, G-1)  # (N, K)
+        iy_all = py_int.clamp(0, G-1)  # (N, K)
+        
+        fire_val = self.fire[env_idx, iy_all, ix_all]       # (N, K)
+        fire_near = self.fire_dist[env_idx, iy_all, ix_all]  # (N, K)
+        thermal_val = self.thermal[env_idx, iy_all, ix_all]  # (N, K)
+        
+        crash_mask = alive & (
+            (fire_val > self.fire_crash_threshold) |
+            (fire_near < 0.5) |
+            (thermal_val > self.thermal_crash)
+        )
+        
+        crashed = crash_mask.clone()
+        self.drone_alive = self.drone_alive & ~crash_mask
+        dones = crash_mask | ~alive
         
         # Fire spread every 3 steps
         if self.step_count % 3 == 0:
@@ -409,7 +427,10 @@ class GPUWildfireEnv:
         return obs, dones, crashed
     
     def _get_obs(self):
-        """Vectorized observation gathering on GPU.
+        """Fully vectorized observation gathering on GPU.
+        
+        Extracts local patches and computes global features for all N×K agents
+        in a single batched operation — no per-env or per-drone Python loops.
         
         Returns:
             obs: (N, K, obs_dim) tensor
@@ -424,53 +445,92 @@ class GPUWildfireEnv:
         
         # Channel stack: fire, thermal, wind_x, wind_y, visited, fire_dist
         fire_dist_norm = (self.fire_dist / 10.0).clamp(0, 1.0)
-        channels = torch.stack([self.fire, self.thermal, self.wind_x, 
+        channels = torch.stack([self.fire, self.thermal, self.wind_x,
                                 self.wind_y, self.shared_visited, fire_dist_norm], dim=1)
         # channels: (N, ch, G, G)
         
         # Pad channels with zeros for boundary handling
         channels_padded = F.pad(channels, (r, r, r, r))  # (N, ch, G+2r, G+2r)
+        padded_G = G + 2 * r
         
-        for i in range(K):
-            alive = self.drone_alive[:, i]  # (N,)
-            if not alive.any():
-                continue
-            
-            px = self.drone_pos[:, i, 0].long().clamp(0, G-1)  # (N,)
-            py = self.drone_pos[:, i, 1].long().clamp(0, G-1)  # (N,)
-            
-            alive_idx = torch.where(alive)[0]
-            for n_idx in alive_idx:
-                n = n_idx.item()
-                ix, iy = px[n].item(), py[n].item()
-                # In padded coords, the center is at (ix+r, iy+r)
-                # Patch is [iy : iy+2r+1, ix : ix+2r+1] in padded coords
-                patch = channels_padded[n, :, iy:iy+2*r+1, ix:ix+2*r+1]  # (ch, 2r+1, 2r+1)
-                obs[n, i, :local_dim] = patch.reshape(-1)
-            
-            # Global features for alive drones
-            alive_idx = torch.where(alive)[0]
-            for n_idx in alive_idx:
-                n = n_idx.item()
-                px_i, py_i = px[n].item(), py[n].item()
-                
-                fire_cells = (self.fire[n] > 0.2).sum().item()
-                fr = float(math.sqrt(max(1, fire_cells))) / G
-                
-                wind_mag = float(math.sqrt(self.wind_x[n, py_i, px_i]**2 + 
-                                           self.wind_y[n, py_i, px_i]**2))
-                wind_dir = float(math.atan2(self.wind_y[n, py_i, px_i],
-                                            self.wind_x[n, py_i, px_i])) / math.pi
-                coverage = float(self.episode_cells[n]) / (G * G)
-                
-                obs[n, i, local_dim:] = torch.tensor([
-                    px_i / G, py_i / G,
-                    self.drone_vel[n, i, 0].item(), self.drone_vel[n, i, 1].item(),
-                    float(self.fire[n, py_i, px_i]),
-                    float(self.thermal[n, py_i, px_i]) / self.thermal_cap,
-                    wind_mag / 30.0, wind_dir,
-                    coverage, fr
-                ], device=device)
+        # All drone positions (N, K)
+        px = self.drone_pos[:, :, 0].long().clamp(0, G - 1)  # (N, K)
+        py = self.drone_pos[:, :, 1].long().clamp(0, G - 1)  # (N, K)
+        
+        # Positions in padded coords — the original code indexes padded grid
+        # directly with original position (not +r), so the patch [iy:iy+2r+1]
+        # includes r cells of zero-padding to the left/top.
+        px_pad = px  # (N, K) — use original coords as padded-grid indices
+        py_pad = py  # (N, K)
+        
+        # Create offset grid: (os_, os_)
+        oy, ox = torch.meshgrid(
+            torch.arange(os_, device=device),
+            torch.arange(os_, device=device),
+            indexing='ij'
+        )
+        
+        # Compute absolute positions in padded grid for each drone's obs patch
+        # Shape: (N, K, os_, os_)
+        abs_y = py_pad.unsqueeze(-1).unsqueeze(-1) + oy.unsqueeze(0).unsqueeze(0)
+        abs_x = px_pad.unsqueeze(-1).unsqueeze(-1) + ox.unsqueeze(0).unsqueeze(0)
+        
+        # Flatten to (N, K, os_*os_)
+        flat_pos = (abs_y * padded_G + abs_x).reshape(N, K, os_ * os_)
+        
+        # Gather patches from all channels at once
+        flat_channels = channels_padded.reshape(N, ch, -1)  # (N, ch, padded_G^2)
+        # Expand to (N, K, ch, padded_G^2) and (N, K, ch, os_*os_)
+        flat_channels_exp = flat_channels.unsqueeze(1).expand(N, K, ch, -1)  # (N, K, ch, padded_G^2)
+        flat_pos_exp = flat_pos.unsqueeze(2).expand(N, K, ch, os_ * os_)     # (N, K, ch, os_*os_)
+        patches = torch.gather(flat_channels_exp, 3, flat_pos_exp)           # (N, K, ch, os_*os_)
+        
+        # Reshape to (N, K, ch * os_ * os_)
+        local_obs = patches.reshape(N, K, local_dim)
+        obs[:, :, :local_dim] = local_obs
+        
+        # ── Global features (all vectorized) ──
+        alive = self.drone_alive  # (N, K)
+        env_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, K)  # (N, K)
+        px_c = px.clamp(0, G-1)
+        py_c = py.clamp(0, G-1)
+        
+        obs[:, :, local_dim + 0] = px.float() / G
+        obs[:, :, local_dim + 1] = py.float() / G
+        obs[:, :, local_dim + 2] = self.drone_vel[:, :, 0]
+        obs[:, :, local_dim + 3] = self.drone_vel[:, :, 1]
+        
+        # Fire/thermal/wind at drone position: (N, K)
+        obs[:, :, local_dim + 4] = self.fire[env_idx, py_c, px_c]
+        obs[:, :, local_dim + 5] = self.thermal[env_idx, py_c, px_c] / self.thermal_cap
+        
+        wx_at = self.wind_x[env_idx, py_c, px_c]
+        wy_at = self.wind_y[env_idx, py_c, px_c]
+        obs[:, :, local_dim + 6] = torch.sqrt(wx_at**2 + wy_at**2) / 30.0
+        obs[:, :, local_dim + 7] = torch.atan2(wy_at, wx_at) / math.pi
+        
+        # Coverage (same for all drones in same env)
+        obs[:, :, local_dim + 8] = self.episode_cells.unsqueeze(1).expand(N, K) / (G * G)
+        
+        # Fire radius approximation (same for all drones in same env)
+        fire_cells = (self.fire > 0.2).sum(dim=(1, 2)).float()  # (N,)
+        fr = torch.sqrt(fire_cells.clamp(min=1)) / G
+        obs[:, :, local_dim + 9] = fr.unsqueeze(1).expand(N, K)
+        
+        # ── Team visited-map cue (global memory) ──
+        # 6×6 adaptive-average pool of the shared visited map: each entry is the
+        # fraction of cells explored in that region. Agents combine this with
+        # their own normalized position (global dims 0-1) to steer toward
+        # unexplored regions instead of re-scanning visited ones.
+        map_dim = self.map_cue_size ** 2
+        vis_map = F.adaptive_avg_pool2d(self.shared_visited.unsqueeze(1),  # (N,1,G,G)
+                                        (self.map_cue_size, self.map_cue_size))
+        vis_map = vis_map.reshape(N, map_dim)  # (N, 36)
+        obs[:, :, local_dim + self.global_base_dim:local_dim + self.global_obs_dim] = \
+            vis_map.unsqueeze(1).expand(N, K, map_dim)
+        
+        # Zero out dead agents
+        obs[~alive] = 0.0
         
         return obs
 
@@ -501,7 +561,7 @@ class BatchedGATPPO:
     GAT and policy networks.
     """
     
-    def __init__(self, obs_dim, act_dim=5, use_gat=True, lr=3e-4, comm_range=10.0):
+    def __init__(self, obs_dim, act_dim=5, use_gat=True, lr=2e-4, comm_range=10.0):
         if use_gat:
             self.gat = GATCommunication(obs_dim, hidden_dim=128, out_dim=64, comm_range=comm_range).to(device)
         else:
@@ -511,17 +571,26 @@ class BatchedGATPPO:
         params = list(self.gat.parameters()) + list(self.policy.parameters())
         self.optimizer = torch.optim.Adam(params, lr=lr, eps=1e-5)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=2000, eta_min=1e-5)
-        self._traj = []
+        # Tensor buffers for fast storage (avoids per-element dict creation)
+        self._obs_buf = []
+        self._act_buf = []
+        self._rew_buf = []
+        self._done_buf = []
+        self._lp_buf = []
+        self._val_buf = []
+        self._aid_buf = []
         self.itse_weight = 0.3
         self.explore_bonus_scale = 2.0
     
-    def select_actions_batched(self, obs, positions, alive_mask):
+    def select_actions_batched(self, obs, positions, alive_mask, greedy=False):
         """Batched action selection across all envs and agents.
         
         Args:
             obs: (N, K, obs_dim) tensor
             positions: (N, K, 2) tensor
             alive_mask: (N, K) bool tensor
+            greedy: if True, take the mode (argmax) action — used for
+                deterministic evaluation/reporting, never during training.
         
         Returns:
             actions: (N, K) int tensor
@@ -536,15 +605,27 @@ class BatchedGATPPO:
         pos_flat = positions.reshape(N * K, 2)
         alive_flat = alive_mask.reshape(N * K)
         
-        # GAT forward pass (batched)
-        enhanced = self.gat(obs_flat, pos_flat, alive_flat)
+        # GAT forward pass (batched). Pass env group ids so attention edges are
+        # confined to agents inside the same environment: the N parallel envs
+        # are independent episodes and must not communicate with each other.
+        if isinstance(self.gat, GATCommunication):
+            group = torch.arange(N, device=device).repeat_interleave(K)
+            enhanced = self.gat(obs_flat, pos_flat, alive_flat, group=group)
+        else:
+            enhanced = self.gat(obs_flat, pos_flat, alive_flat)
         
         # Policy forward pass
         with torch.no_grad():
             logits, values = self.policy(enhanced)
             dist = torch.distributions.Categorical(logits=logits)
-            actions = dist.sample()
-            log_probs = dist.log_prob(actions)
+            if greedy:
+                # Deterministic (mode) actions for evaluation/reporting — a
+                # published number must not depend on sampling noise.
+                actions = logits.argmax(dim=-1)
+                log_probs = dist.log_prob(actions)
+            else:
+                actions = dist.sample()
+                log_probs = dist.log_prob(actions)
         
         # Mask dead agents
         actions = actions.reshape(N, K)
@@ -561,52 +642,88 @@ class BatchedGATPPO:
         return actions, log_probs, values, enhanced_obs
     
     def store_batched(self, enhanced_obs, actions, rewards, dones, log_probs, values):
-        """Store transitions from all N environments."""
-        N, K = actions.shape
-        for n in range(N):
-            for k in range(K):
-                self._traj.append({
-                    'obs': enhanced_obs[n, k].detach().cpu(),
-                    'action': actions[n, k].item(),
-                    'reward': rewards[n, k].item(),
-                    'done': dones[n, k].item(),
-                    'log_prob': log_probs[n, k].item(),
-                    'value': values[n, k].item(),
-                    'agent_id': k
-                })
+        """Store transitions from all N environments using on-device tensor buffers.
+        
+        Replaces per-element dict creation with batch tensor ops and avoids a
+        per-step GPU→CPU round trip (update() concatenates straight from the buffer).
+        Each stored row is one (env, agent) transition; rows are stacked per step.
+        """
+        # Flatten N×K to a single batch dim (row = env * K + agent)
+        self._obs_buf.append(enhanced_obs.detach().reshape(-1, enhanced_obs.shape[-1]))
+        self._act_buf.append(actions.reshape(-1))
+        self._rew_buf.append(rewards.reshape(-1))
+        self._done_buf.append(dones.reshape(-1))
+        self._lp_buf.append(log_probs.reshape(-1))
+        self._val_buf.append(values.reshape(-1))
     
-    def update(self, gamma=0.99, gae_lambda=0.95, n_epochs=6, batch_size=1024, clip_eps=0.2, entropy_coef=0.02):
-        """PPO update using collected trajectories."""
-        if not self._traj:
+    def update(self, gamma=0.99, gae_lambda=0.95, n_epochs=3, batch_size=2048, clip_eps=0.2, entropy_coef=0.02):
+        """PPO update using on-device tensor buffers.
+        
+        GAE is computed per (env, agent) rollout: the buffer rows are stacked per
+        step, so each row is one agent in one environment over time. Advantages are
+        therefore bootstraped only from that agent's own environment — NOT chained
+        across the independent parallel environments (which injected cross-env
+        value noise into every advantage and destabilized training). Fully
+        vectorized, no per-transition .item() / GPU-CPU sync.
+        """
+        if not self._obs_buf:
             return 0.0
         
-        n = len(self._traj)
-        advantages = np.zeros(n, dtype=np.float32)
-        returns = np.zeros(n, dtype=np.float32)
+        S = len(self._obs_buf)          # rollout steps
+        # Per-step stacked rows, step-major (used for the minibatch training)
+        all_obs = torch.cat(self._obs_buf, dim=0)
+        all_actions = torch.cat(self._act_buf, dim=0).long()
+        all_old_lp = torch.cat(self._lp_buf, dim=0)
+        all_values = torch.cat(self._val_buf, dim=0)
+        n = all_obs.shape[0]
+        M = n // S
         
-        # Compute GAE per agent
-        agent_groups = defaultdict(list)
-        for i, t in enumerate(self._traj):
-            agent_groups[t['agent_id']].append(i)
+        # Reshape per-step buffers into (M rows, S steps) per-row timelines.
+        # Row r = (env r//K, agent r%K) stays constant across steps, so a GAE over
+        # its own timeline is a correct per-environment rollout.
+        def to_mat(buf):
+            return torch.stack(buf, dim=1)          # (M, S)
+        R = to_mat(self._rew_buf)
+        V = to_mat(self._val_buf)
+        D = to_mat(self._done_buf)
         
-        for aid, indices in agent_groups.items():
-            gae = 0.0
-            for k in reversed(range(len(indices))):
-                idx = indices[k]
-                next_idx = indices[k + 1] if k + 1 < len(indices) else None
-                next_val = 0.0 if next_idx is None else self._traj[next_idx]['value']
-                next_done = 1.0 if next_idx is None else self._traj[next_idx]['done']
-                delta = self._traj[idx]['reward'] + gamma * next_val * (1 - next_done) - self._traj[idx]['value']
-                gae = delta + gamma * gae_lambda * (1 - next_done) * gae
-                advantages[idx] = gae
-                returns[idx] = gae + self._traj[idx]['value']
+        # Clear buffers
+        self._obs_buf.clear()
+        self._act_buf.clear()
+        self._rew_buf.clear()
+        self._done_buf.clear()
+        self._lp_buf.clear()
+        self._val_buf.clear()
         
-        all_obs = torch.stack([t['obs'].squeeze(0) for t in self._traj]).to(device)
-        all_actions = torch.tensor([t['action'] for t in self._traj], dtype=torch.long, device=device)
-        all_old_lp = torch.tensor([t['log_prob'] for t in self._traj], dtype=torch.float32, device=device)
-        all_adv = torch.tensor(advantages, dtype=torch.float32, device=device)
-        all_ret = torch.tensor(returns, dtype=torch.float32, device=device)
-        all_adv = (all_adv - all_adv.mean()) / (all_adv.std() + 1e-8)
+        # delta_t = R_t + gamma * V_{t+1} * (1 - D_{t+1}) - V_t   (past episode end: V=0, D=1)
+        Vn = torch.zeros_like(V)
+        Dn = torch.ones_like(D)
+        Vn[:, :-1] = V[:, 1:]
+        Dn[:, :-1] = D[:, 1:]
+        delta = R + gamma * Vn * (1 - Dn) - V
+        # decay m_t = gamma*lambda*(1 - D_{t+1}); reversed recurrence a = x + r*a_prev
+        c = gamma * gae_lambda
+        m = c * (1 - Dn)
+        x = torch.flip(delta, dims=[1])
+        r = torch.flip(m, dims=[1])
+        # Masked-scan closed form along each row (S ≤ 300 ⇒ c**(±u) stays in fp32):
+        # a_j = x_j + r_j a_{j-1}, where r_j ∈ {0, c} (r=0 at episode/agent boundaries).
+        # With u = steps since the last boundary, a_j = c^u * cumsum_{run}(x * c^-u).
+        ar = torch.arange(S, device=device, dtype=torch.float32).unsqueeze(0)  # (1, S)
+        z = r <= 0.0                                                            # (M, S)
+        lastz = torch.cummax(torch.where(z, ar.expand(M, S), ar.new_full((), -1.0)), dim=1).values
+        u = ar - lastz.clamp(min=0.0)                                            # (M, S)
+        inv = torch.pow(c, -u)
+        scl = torch.pow(c, u)
+        pref = torch.cumsum(x * inv, dim=1)
+        idx = (lastz - 1.0).long().clamp(min=0)
+        off = torch.where(lastz >= 1.0, torch.gather(pref, 1, idx), torch.zeros_like(pref))
+        y = scl * (pref - off)
+        adv_mat = torch.flip(y, dims=[1])                                        # (M, S)
+        # Back to step-major ordering (matches all_obs / all_values)
+        advantages = adv_mat.transpose(0, 1).reshape(-1)
+        returns = advantages + all_values
+        all_adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         total_loss, count = 0.0, 0
         all_params = list(self.gat.parameters()) + list(self.policy.parameters())
@@ -619,7 +736,7 @@ class BatchedGATPPO:
                 ratio = torch.exp(new_lp - all_old_lp[idx])
                 s1 = ratio * all_adv[idx]
                 s2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * all_adv[idx]
-                loss = -torch.min(s1, s2).mean() + 0.5 * F.mse_loss(vals, all_ret[idx]) - entropy_coef * entropy.mean()
+                loss = -torch.min(s1, s2).mean() + 0.5 * F.mse_loss(vals, returns[idx]) - entropy_coef * entropy.mean()
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(all_params, 0.5)
@@ -627,7 +744,6 @@ class BatchedGATPPO:
                 total_loss += loss.item()
                 count += 1
         
-        self._traj.clear()
         self.scheduler.step()
         return total_loss / max(1, count)
     
@@ -638,6 +754,126 @@ class BatchedGATPPO:
         ckpt = torch.load(path, map_location=device)
         self.gat.load_state_dict(ckpt['gat'])
         self.policy.load_state_dict(ckpt['policy'])
+
+
+# ────────────────────────────────────────────────────────────────────
+# FRESH-EPISODE EVALUATION — ONE environment for ALL published rows
+#
+# batched_train() and gpu_run_full_pipeline() publish numbers from FRESH
+# episodes run in the SAME batched env the agent trained in — never
+# train-time logged coverage and never a second, independently-implemented
+# environment. Random / Greedy / PID baselines are evaluated here too, with
+# the identical action envelope (5 discrete actions, same physics) as the
+# trained policies, so every row of a comparison table is comparable.
+# ────────────────────────────────────────────────────────────────────
+
+def _run_batched_rollouts(action_fn, grid=30, n_drones=10, max_steps=300,
+                          n_envs=32, n_eps=None, wind=0.0, seed=None):
+    """Run n_eps fresh episodes in the batched env using action_fn(o, env).
+
+    Every (env, drone) resets from the same seeded stream, so calling with the
+    same seed reproduces the same initial conditions for every policy.
+
+    Returns (mean_cov, std_cov, mean_safe, std_safe): coverage = fraction of
+    grid cells the swarm visited by episode end; survival = fraction of drones
+    alive at episode end (per-episode, pooled).
+    """
+    if n_eps is None:
+        n_eps = n_envs
+    covs, safes = [], []
+    eps_done = 0
+    while eps_done < n_eps:
+        b = min(n_envs, n_eps - eps_done)
+        if seed is not None:
+            torch.manual_seed(seed + eps_done)
+        env = GPUWildfireEnv(n_envs=b, grid=grid, n_drones=n_drones,
+                             max_steps=max_steps, wind_speed=wind)
+        o = env.reset()
+        for _ in range(max_steps):
+            if not env.drone_alive.any():
+                break
+            acts = action_fn(o, env)
+            o, d, _ = env.step(acts)
+            if d.all():
+                break
+        covs.extend((env.total_cells_explored.sum(dim=(1, 2)).float()
+                     / (grid * grid) * 100).cpu().tolist())
+        safes.extend((env.drone_alive.sum(dim=1).float()
+                      / n_drones * 100).cpu().tolist())
+        eps_done += b
+    return (float(np.mean(covs)), float(np.std(covs)),
+            float(np.mean(safes)), float(np.std(safes)))
+
+
+def _random_actions(o, env):
+    """Uniform-random actions over the same 5-action envelope as the policies."""
+    a = torch.randint(0, 5, (env.n_envs, env.n_drones), device=device)
+    a[~env.drone_alive] = 0
+    return a
+
+
+def _greedy_baseline_actions(o, env):
+    """Move toward the best (unvisited, near-fire) neighbor cell (per drone)."""
+    N, G, K = env.n_envs, env.grid, env.n_drones
+    ix = env.drone_pos[:, :, 0].long().clamp(0, G - 1)   # (N, K)
+    iy = env.drone_pos[:, :, 1].long().clamp(0, G - 1)
+    dd = env.action_deltas.long()                         # (5, 2)
+    nx_raw = ix.unsqueeze(-1) + dd[:, 0].view(1, 1, 5)   # (N, K, 5)
+    ny_raw = iy.unsqueeze(-1) + dd[:, 1].view(1, 1, 5)
+    nx = nx_raw.clamp(0, G - 1)
+    ny = ny_raw.clamp(0, G - 1)
+    env_i = torch.arange(N, device=device).view(N, 1, 1).expand(N, K, 5)
+    vis = env.shared_visited[env_i, ny, nx]               # 1.0 if already visited
+    fd = env.fire_dist[env_i, ny, nx]
+    ok = ((nx_raw >= 0) & (nx_raw < G) & (ny_raw >= 0) & (ny_raw < G)
+          & env.drone_alive.unsqueeze(-1))
+    v = (vis < 0.5).float() + 2.0 / (fd + 1.0)
+    a = torch.where(ok, v, torch.full_like(v, -1e9)).argmax(dim=-1)
+    a[~env.drone_alive] = 0
+    return a
+
+
+def _pid_baseline_actions(o, env):
+    """Orbit the fire center perpendicular-to-radius (mirrors CPU eval_pid)."""
+    N, K = env.n_envs, env.n_drones
+    dx = env.drone_pos[:, :, 0] - env.fire_center_x.view(N, 1)
+    dy = env.drone_pos[:, :, 1] - env.fire_center_y.view(N, 1)
+    take_x = dx.abs() > dy.abs()
+    three = torch.full((N, K), 3, dtype=torch.long, device=device)
+    four = torch.full((N, K), 4, dtype=torch.long, device=device)
+    one = torch.full((N, K), 1, dtype=torch.long, device=device)
+    two = torch.full((N, K), 2, dtype=torch.long, device=device)
+    a = torch.where(take_x, torch.where(dx < 0, three, four),
+                    torch.where(dy < 0, one, two))
+    a[~env.drone_alive] = 0
+    return a
+
+
+def _trained_agent_actions(agent, greedy=False):
+    """Action fn for a trained agent checkpoint.
+
+    Default (greedy=False): SAMPLE from the policy's action distribution — the
+    same mechanism used in training/deployment, so the published number is the
+    expected coverage/safety of the policy the agent actually implements.
+    (Mode/argmax actions collapse to near-stasis for this reactive policy and
+    would misrepresent it.) Rollouts are seeded, so results stay reproducible.
+    greedy=True is available for an explicit mode-action measurement.
+    """
+    def fn(o, env):
+        with torch.no_grad():
+            acts, _, _, _ = agent.select_actions_batched(
+                o, env.drone_pos, env.drone_alive, greedy=greedy)
+        return acts
+    return fn
+
+
+def _eval_result(action_fn, grid=30, n_drones=10, max_steps=300,
+                 n_envs=32, n_eps=20, wind=0.0, seed=None):
+    """Fresh batched-env evaluation, formatted like the CPU baseline dicts."""
+    cm, cs, sm, ss = _run_batched_rollouts(
+        action_fn, grid=grid, n_drones=n_drones, max_steps=max_steps,
+        n_envs=n_envs, n_eps=n_eps, wind=wind, seed=seed)
+    return {'safety': sm, 'coverage': cm, 'safety_std': ss, 'coverage_std': cs}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -676,13 +912,19 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
         while episodes_done < n_episodes:
             # Run one batch of n_envs parallel episodes
             obs = env.reset()
-            agent._traj.clear()
+            agent._obs_buf.clear()
+            agent._act_buf.clear()
+            agent._rew_buf.clear()
+            agent._done_buf.clear()
+            agent._lp_buf.clear()
+            agent._val_buf.clear()
+            agent._aid_buf.clear()
             batch_crashes = torch.zeros(n_envs, n_drones, device=device)
             batch_rewards = torch.zeros(n_envs, device=device)
             batch_coverages = torch.zeros(n_envs, device=device)
             
             for step in range(max_steps):
-                am = env.drone_alive  # (N, K)
+                am = env.drone_alive  # (N, K) — alive at the START of this step
                 pos = env.drone_pos  # (N, K, 2)
                 
                 if not am.any():
@@ -693,45 +935,49 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
                 prev_visited = env.shared_visited.clone()
                 
                 obs_next, dones, crashed = env.step(actions)
+                is_terminal = bool(dones.all().item())
                 
-                # Compute rewards for all envs × agents
-                cur_coverage = env.total_cells_explored.sum(dim=(1, 2)).float() / (grid * grid) * 100  # (N,)
+                # ── Rewards: per-agent personal credit (no env-shared free-riding) ──
+                px_now = env.drone_pos[:, :, 0].long().clamp(0, grid - 1)  # (N, K)
+                py_now = env.drone_pos[:, :, 1].long().clamp(0, grid - 1)
+                env_idx_all = torch.arange(n_envs, device=device).unsqueeze(1).expand(n_envs, n_drones)
+                # Own new cell: this drone's current cell was unvisited at step start.
+                # (Rewarding the ENV-wide count to every agent let drones free-ride on
+                # others' exploration and collapse to hovering at the fire edge.)
+                own_new = (prev_visited[env_idx_all, py_now, px_now] < 0.5) & am
                 
                 rewards = torch.zeros(n_envs, n_drones, device=device)
-                for i in range(n_drones):
-                    alive = am[:, i]
-                    if not alive.any():
-                        continue
-                    
-                    new_cells = ((prev_visited < 0.5) & (env.shared_visited > 0.5)).sum(dim=(1, 2)).float()  # (N,)
-                    
-                    # Exploration reward: +30/cell
-                    rewards[:, i] += 30.0 * new_cells
-                    
-                    # Frontier bonus
-                    has_new = new_cells > 0
-                    rewards[has_new, i] += 15.0
-                    no_new = ~has_new
-                    rewards[no_new & (cur_coverage < 90), i] += 2.0
-                    
-                    # Coverage reward
-                    rewards[:, i] += 50.0 * cur_coverage / 100.0
-                    
-                    # Fire proximity (safe zone)
-                    env_idx = torch.arange(n_envs, device=device)
-                    fd = env.fire_dist[env_idx, 
-                                       (pos[:, i, 1]).long().clamp(0, grid-1),
-                                       (pos[:, i, 0]).long().clamp(0, grid-1)]
-                    safe_fire = (fd > 0.5) & (fd < 8.0)
-                    rewards[safe_fire, i] += 12.0 * (1.0 - (fd[safe_fire] - 2.5).abs() / 5.5).clamp(0)
-                    
-                    # Survival
-                    rewards[:, i] += 0.5
-                    
-                    # Crash penalty
-                    rewards[crashed[:, i], i] = -30.0
-                    
-                    batch_crashes[:, i] = crashed[:, i].float()
+                rewards += 60.0 * own_new.float()             # personal exploration credit
+                rewards += 1.5 * am.float()                   # survival tick (per step alive)
+                
+                # Fire-approach shaping: mild penalty for hugging the fire edge so
+                # the agent learns boundaries from the obs channels instead of by
+                # crashing, without paying drones to loiter at fd≈2.5.
+                fd_now = env.fire_dist[env_idx_all, py_now, px_now]
+                rewards -= 2.0 * ((fd_now < 1.5) & am).float()
+                
+                # Crowding penalty: without a dispersal incentive the team herds
+                # into one cluster (final pairwise drone distance ~1-2 cells) and
+                # covers a single corridor instead of sweeping the map.
+                dp = env.drone_pos.unsqueeze(1) - env.drone_pos.unsqueeze(2)      # (N,K,K,2)
+                dd = (dp * dp).sum(-1).sqrt()                                     # (N,K,K)
+                eye = torch.eye(n_drones, dtype=torch.bool, device=device)
+                close = (dd < 3.0) & ~eye.unsqueeze(0) & am.unsqueeze(1) & am.unsqueeze(2)
+                n_neigh = close.sum(dim=2).float()                                 # (N,K)
+                rewards -= 2.5 * n_neigh
+                
+                # Crash penalty
+                rewards[crashed] = -50.0
+                
+                # Episode-end coverage bonus (only on the final stored step)
+                cur_coverage = env.total_cells_explored.sum(dim=(1, 2)).float() / (grid * grid) * 100  # (N,)
+                if is_terminal:
+                    rewards += 100.0 * (cur_coverage / 100.0).unsqueeze(1).expand(n_envs, n_drones) * am.float()
+                
+                # Dead rows (post-crash) contribute nothing
+                rewards[~am] = 0.0
+                
+                batch_crashes += crashed.float()
                 
                 # Store transitions
                 agent.store_batched(enhanced, actions, rewards, dones.float(), log_probs, values)
@@ -742,18 +988,26 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
                 if dones.all():
                     break
             
-            # PPO update
-            agent.update()
+            # PPO update (gentler: fewer epochs, larger minibatches for ~96k-transition batches)
+            agent.update(gamma=0.99, gae_lambda=0.95, n_epochs=3, batch_size=2048, entropy_coef=0.04)
             
-            # Record stats for this batch
-            for n in range(n_envs):
-                cov = float(env.total_cells_explored[n].sum()) / (grid * grid) * 100
-                saf = float(1.0 - batch_crashes[n].sum() / n_drones) * 100
-                rewards_h.append(float(batch_rewards[n]))
-                coverage_h.append(cov)
-                safety_h.append(saf)
+            # Record stats for this batch (vectorized)
+            covs = env.total_cells_explored.sum(dim=(1, 2)).float() / (grid * grid) * 100  # (N,)
+            safes = (1.0 - batch_crashes.sum(dim=1) / n_drones) * 100  # (N,)
+            rewards_h.extend(batch_rewards.cpu().tolist())
+            coverage_h.extend(covs.cpu().tolist())
+            safety_h.extend(safes.cpu().tolist())
             
             episodes_done += n_envs
+            
+            # Best-checkpoint tracking on a smoothed window of the last ~3 batches
+            # (per-batch, so the best policy mid-run is captured — not just the
+            # sparse log points every ~100 episodes).
+            w = min(3 * n_envs, len(coverage_h))
+            win_cov = float(np.mean(coverage_h[-w:]))
+            if win_cov > best_cov:
+                best_cov = win_cov
+                agent.save(f'{run_id}_best.pt')
             
             # Log every 100 episodes
             if episodes_done % 100 <= n_envs:
@@ -767,22 +1021,38 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
                 exp_speed = np.mean(np.diff(coverage_h[-window:])) if len(coverage_h) > 1 else 0
                 
                 print(f"Ep {episodes_done:5d}/{n_episodes} | R: {avg_r:7.1f} | Cov: {avg_cov:5.1f}% | Safe: {avg_saf:4.0f}% | Speed: {exp_speed:+.3f}%/ep | {eps_per_sec:.1f} ep/s | ETA {eta_min:.0f}m", flush=True)
-                
-                if avg_cov > best_cov:
-                    best_cov = avg_cov
-                    agent.save(f'{run_id}_best.pt')
     
     except (KeyboardInterrupt, SystemExit, Exception) as e:
         print(f"\nTraining interrupted at ep {episodes_done}: {e}", flush=True)
     
     agent.save(f'{run_id}_final.pt')
     
+    # ── Fresh-env evaluation of the FINAL checkpoint ──
+    # The number tables publish for this run is measured on FRESH episodes in
+    # the SAME batched env used for training, sampling from the policy's own
+    # action distribution (seeded for reproducibility) — exactly like the
+    # Random/Greedy/PID rows it is compared against — never train-time logged
+    # coverage (which mixes shaped-reward episodes into the number) and never
+    # a second, differently-implemented environment.
+    train_final_cov = float(np.mean(coverage_h[-100:])) if len(coverage_h) >= 100 else float(np.mean(coverage_h))
+    train_final_saf = float(np.mean(safety_h[-100:])) if len(safety_h) >= 100 else float(np.mean(safety_h))
+    eval_cov_m, eval_cov_s, eval_saf_m, eval_saf_s = _run_batched_rollouts(
+        _trained_agent_actions(agent), grid=grid, n_drones=n_drones,
+        max_steps=max_steps, n_envs=n_envs, n_eps=n_envs, wind=0.0,
+        seed=seed + 9000)
+    
     results = {
         'n_episodes': len(coverage_h),
         'seed': seed,
         'final_reward': float(np.mean(rewards_h[-100:])) if len(rewards_h) >= 100 else float(np.mean(rewards_h)),
-        'final_coverage': float(np.mean(coverage_h[-100:])) if len(coverage_h) >= 100 else float(np.mean(coverage_h)),
-        'final_safety': float(np.mean(safety_h[-100:])) if len(safety_h) >= 100 else float(np.mean(safety_h)),
+        # Fresh-env numbers — what comparison tables publish.
+        'final_coverage': float(eval_cov_m),
+        'coverage_std': float(eval_cov_s),
+        'final_safety': float(eval_saf_m),
+        'safety_std': float(eval_saf_s),
+        # Train-time logged stats, kept for diagnostics (labeled as such).
+        'train_final_coverage': train_final_cov,
+        'train_final_safety': train_final_saf,
         'rewards': [float(x) for x in rewards_h],
         'coverages': [float(x) for x in coverage_h],
         'safety': [float(x) for x in safety_h],
@@ -792,7 +1062,9 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
         json.dump(results, f, indent=2)
     
     total_time = time.time() - t0
-    print(f"\nDone in {total_time:.0f}s ({total_time/60:.1f}m) | Reward: {results['final_reward']:.1f} | Coverage: {results['final_coverage']:.1f}% | Safety: {results['final_safety']:.0f}%", flush=True)
+    print(f"\nDone in {total_time:.0f}s ({total_time/60:.1f}m) | Reward: {results['final_reward']:.1f} | "
+          f"Coverage: {results['final_coverage']:.1f}% (fresh sampled, n={n_envs}) | "
+          f"train-time: {train_final_cov:.1f}% | Safety: {results['final_safety']:.0f}%", flush=True)
     print(f"Speed: {len(coverage_h)/total_time:.1f} episodes/sec ({n_envs} parallel envs)", flush=True)
     
     return agent, results
@@ -820,9 +1092,7 @@ def gpu_run_full_pipeline():
     
     # Import everything from the main module
     from kaggle_full_run import (
-        eval_random, eval_greedy, eval_pid, eval_trained_agent,
-        train_mappo, train_ippo, statistical_analysis, generate_figures,
-        WildfireEnv, FastGATPPO
+        train_mappo, train_ippo, statistical_analysis, generate_figures
     )
     
     # ═══ PHASE 1: Train GAT-ITSE × 3 seeds (GPU) ═══
@@ -875,11 +1145,18 @@ def gpu_run_full_pipeline():
     
     # ═══ PHASE 5: Non-learned baselines ═══
     print("\n" + "=" * 60, flush=True)
-    print("PHASE 5: Evaluating Baselines", flush=True)
+    print("PHASE 5: Evaluating Baselines (fresh episodes, batched env)", flush=True)
     print("=" * 60, flush=True)
-    random_res = eval_random(grid, n_drones, max_steps, wind=0.0, n_eps=20)
-    greedy_res = eval_greedy(grid, n_drones, max_steps, wind=0.0, n_eps=20)
-    pid_res = eval_pid(grid, n_drones, max_steps, wind=0.0, n_eps=20)
+    # Baselines are evaluated in the SAME batched env as the trained agents
+    # (identical physics and the same 5-action envelope) so every row of the
+    # published table comes from one environment. Same seed => all methods see
+    # the identical set of initial fire/spawn states.
+    random_res = _eval_result(_random_actions, grid, n_drones, max_steps,
+                              n_envs=n_envs, n_eps=20, seed=4242)
+    greedy_res = _eval_result(_greedy_baseline_actions, grid, n_drones, max_steps,
+                              n_envs=n_envs, n_eps=20, seed=4242)
+    pid_res = _eval_result(_pid_baseline_actions, grid, n_drones, max_steps,
+                           n_envs=n_envs, n_eps=20, seed=4242)
     
     # ═══ AGGREGATE ALL RESULTS ═══
     all_results = {}
@@ -943,14 +1220,23 @@ def gpu_run_full_pipeline():
     best_seed_idx = int(np.argmax(gat_covs))
     best_agent = gat_agents[best_seed_idx]
     wind_results = {}
+    # Wind sweeps run in the same batched env (it supports wind_speed) with the
+    # same fresh-episode protocol as the main table.
     for wind in [5, 10, 15, 20, 25]:
         print(f"  Wind = {wind} m/s", flush=True)
         wind_results[wind] = {}
-        wind_results[wind]['GAT-ITSE'] = eval_trained_agent(
-            best_agent, grid, n_drones, max_steps, wind=wind, n_eps=20, use_gat=True)
-        wind_results[wind]['Random'] = eval_random(grid, n_drones, max_steps, wind=wind, n_eps=20)
-        wind_results[wind]['Greedy'] = eval_greedy(grid, n_drones, max_steps, wind=wind, n_eps=20)
-        wind_results[wind]['PID'] = eval_pid(grid, n_drones, max_steps, wind=wind, n_eps=20)
+        wind_results[wind]['GAT-ITSE'] = _eval_result(
+            _trained_agent_actions(best_agent), grid, n_drones, max_steps,
+            n_envs=n_envs, n_eps=20, wind=wind, seed=4242 + wind)
+        wind_results[wind]['Random'] = _eval_result(
+            _random_actions, grid, n_drones, max_steps,
+            n_envs=n_envs, n_eps=20, wind=wind, seed=4242 + wind)
+        wind_results[wind]['Greedy'] = _eval_result(
+            _greedy_baseline_actions, grid, n_drones, max_steps,
+            n_envs=n_envs, n_eps=20, wind=wind, seed=4242 + wind)
+        wind_results[wind]['PID'] = _eval_result(
+            _pid_baseline_actions, grid, n_drones, max_steps,
+            n_envs=n_envs, n_eps=20, wind=wind, seed=4242 + wind)
         print(f"    GAT-ITSE: Safety={wind_results[wind]['GAT-ITSE']['safety']:.1f}%, Cov={wind_results[wind]['GAT-ITSE']['coverage']:.1f}%", flush=True)
     
     # ═══ PHASE 7: Scalability ═══
@@ -961,15 +1247,21 @@ def gpu_run_full_pipeline():
     for n_d in [5, 10, 20]:
         print(f"  Swarm = {n_d} drones", flush=True)
         scalability_results['swarm'][n_d] = {}
-        scalability_results['swarm'][n_d]['GAT-ITSE'] = eval_trained_agent(
-            best_agent, grid, n_d, max_steps, wind=0, n_eps=10, use_gat=True)
-        scalability_results['swarm'][n_d]['Random'] = eval_random(grid, n_d, max_steps, wind=0, n_eps=10)
+        scalability_results['swarm'][n_d]['GAT-ITSE'] = _eval_result(
+            _trained_agent_actions(best_agent), grid, n_d, max_steps,
+            n_envs=10, n_eps=10, wind=0, seed=4242 + n_d)
+        scalability_results['swarm'][n_d]['Random'] = _eval_result(
+            _random_actions, grid, n_d, max_steps,
+            n_envs=10, n_eps=10, wind=0, seed=4242 + n_d)
     for gs in [20, 30, 50]:
         print(f"  Grid = {gs}×{gs}", flush=True)
         scalability_results['grid'][gs] = {}
-        scalability_results['grid'][gs]['GAT-ITSE'] = eval_trained_agent(
-            best_agent, gs, n_drones, max_steps, wind=0, n_eps=10, use_gat=True)
-        scalability_results['grid'][gs]['Random'] = eval_random(gs, n_drones, max_steps, wind=0, n_eps=10)
+        scalability_results['grid'][gs]['GAT-ITSE'] = _eval_result(
+            _trained_agent_actions(best_agent), gs, n_drones, max_steps,
+            n_envs=10, n_eps=10, wind=0, seed=4242 + gs)
+        scalability_results['grid'][gs]['Random'] = _eval_result(
+            _random_actions, gs, n_drones, max_steps,
+            n_envs=10, n_eps=10, wind=0, seed=4242 + gs)
     
     # ═══ PHASE 8: Statistical Analysis ═══
     print("\n" + "=" * 60, flush=True)
