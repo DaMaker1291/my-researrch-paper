@@ -2160,7 +2160,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--episodes', type=int, default=500)
     parser.add_argument('--quick', action='store_true', help='Quick mode: 100 eps, 1 seed')
-    args = parser.parse_args()
+    # Use parse_known_args so Kaggle/Jupyter notebooks don't crash on extra sys.argv
+    args, _ = parser.parse_known_args()
     
     if args.quick:
         # Quick test mode
@@ -2169,3 +2170,8 @@ if __name__ == "__main__":
         print(f"\nQuick test result: Coverage={res['final_coverage']:.1f}%, Safety={res['final_safety']:.0f}%")
     else:
         run_full_pipeline()
+else:
+    # When imported (e.g. Kaggle notebook cell), run the full pipeline directly
+    # To run quick mode in a notebook cell instead:
+    #   import kaggle_full_run; kaggle_full_run.train(100, run_id="quick_test")
+    pass
