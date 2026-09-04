@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time, json, os, math
+import threading
+import subprocess
 from collections import defaultdict
 
 # ─── Device Setup ───
@@ -1518,11 +1520,87 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
 # SECTION 5: FULL GPU PIPELINE
 # ═══════════════════════════════════════════════════════════════
 
-def gpu_run_full_pipeline():
+# ═══════════════════════════════════════════════════════════════
+# PARALLEL CPU-JOB ORCHESTRATION
+# ═══════════════════════════════════════════════════════════════
+# The single-env CPU trainings (No-GP / No-CBF / MAPPO / IPPO seeds) are
+# mutually independent and write disjoint run_ids, so gpu_run_full_pipeline
+# farms them out to fresh-interpreter subprocesses (one per CPU core) that run
+# WHILE the batched GPU trainings execute in the parent process. Each
+# subprocess calls the exact same function with the exact same arguments the
+# sequential pipeline used, so every checkpoint and *_training_results.json it
+# writes is identical to a sequential run - only wall-clock changes. Pass
+# parallel=False (or set the env var PIPELINE_PARALLEL=0) to restore the
+# original strictly-sequential behaviour.
+
+
+def _cpu_job_main(args_json):
+    """Subprocess entry point: python -m gpu_accelerated --cpu-job <json>."""
+    args = json.loads(args_json)
+    kind = args.pop("kind")
+    from kaggle_full_run import train, train_mappo, train_ippo
+    fn = {"train": train, "mappo": train_mappo, "ippo": train_ippo}[kind]
+    fn(**args)
+    print(f"CPU-JOB-COMPLETE {kind}", flush=True)
+
+
+def _cpu_job_pool_worker(cpu_jobs, n_workers, out):
+    """Run the CPU jobs through a fixed-size subprocess pool. Each finished
+    job's results-JSON path is stored in `out` keyed by job['key'] (None on
+    failure), and progress is printed as jobs complete."""
+    pending = list(cpu_jobs)
+    running = []
+    total = len(pending)
+    done = 0
+    n_workers = max(1, min(n_workers, total))
+    while pending or running:
+        while len(running) < n_workers and pending:
+            job = pending.pop(0)
+            log_path = f"{job['key']}_cpu_job.log"
+            logf = open(log_path, "w")
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+            # Run the file directly (not -m): sys.path[0] then points at the
+            # directory holding gpu_accelerated.py + kaggle_full_run.py, so the
+            # child resolves the right modules regardless of cwd/PYTHONPATH.
+            script = os.path.abspath(__file__)
+            cmd = [sys.executable, script, "--cpu-job",
+                   json.dumps({"kind": job["kind"], **job["args"]})]
+            proc = subprocess.Popen(cmd, cwd=os.getcwd(), env=env,
+                                    stdout=logf, stderr=subprocess.STDOUT)
+            running.append([proc, job, logf])
+        time.sleep(10)
+        still = []
+        for proc, job, logf in running:
+            rc = proc.poll()
+            if rc is None:
+                still.append([proc, job, logf])
+                continue
+            logf.close()
+            done += 1
+            if rc == 0 and os.path.exists(job["result"]):
+                print(f"  [cpu {done}/{total}] {job['label']} -> {job['result']}",
+                      flush=True)
+                out[job["key"]] = job["result"]
+            else:
+                print(f"  [cpu {done}/{total}] {job['label']} FAILED (rc={rc}); "
+                      f"see {job['key']}_cpu_job.log", flush=True)
+                out[job["key"]] = None
+        running = still
+
+
+def gpu_run_full_pipeline(fast=False, parallel=True, n_cpu_workers=None):
     """Full research pipeline optimized for dual T4 GPU.
     
     All 9 phases from the paper, with GPU-accelerated training.
     Estimated time: 30-60 min on dual T4 (vs 8+ hours on CPU).
+
+    fast=True skips the four single-env CPU ablation trainings (No-GP /
+    No-CBF / MAPPO / IPPO) so the GPU core + baselines + wind + scalability
+    + stats + figures finish in ~10-20 min; gpu_benchmark_results.json is
+    then tagged mode='fast'. parallel=True (default) runs those CPU ablation
+    trainings as parallel subprocesses alongside the GPU trainings, cutting
+    the full run to the length of its longest CPU job instead of their sum.
     """
     total_start = time.time()
     
@@ -1533,11 +1611,69 @@ def gpu_run_full_pipeline():
     grid, n_drones, max_steps = 30, 10, 300
     n_envs = 32
     train_eps = 500
+    # Hidden smoke knob: PIPELINE_SMOKE=<frac> scales every training (GPU and
+    # CPU-ablation) episode count down so the full parallel pipeline can be
+    # exercised end-to-end in minutes (also useful as a first-run Kaggle check).
+    smoke_frac = float(os.environ["PIPELINE_SMOKE"]) if os.environ.get("PIPELINE_SMOKE") else 1.0
+    if smoke_frac < 1.0:
+        train_eps = max(3, int(500 * smoke_frac))
+        cpu_eps = lambda full: max(3, int(full * smoke_frac))
+        print(f"  PIPELINE_SMOKE={smoke_frac}: reduced episode counts "
+              f"(GPU {train_eps} eps/seed)", flush=True)
+    else:
+        cpu_eps = lambda full: full
     
     # Import everything from the main module
     from kaggle_full_run import (
         train_mappo, train_ippo, statistical_analysis, generate_figures
     )
+    
+    # CPU ablation trainings (single-env, CPU) are independent jobs with
+    # disjoint run_ids. Unless fast=True they run as parallel subprocesses
+    # while the batched GPU trainings below run in this process.
+    cpu_jobs = []
+    if not fast:
+        cpu_jobs = [
+            {"key": "nogp", "kind": "train", "label": "No-GP (200 ep)",
+             "result": "gpu_nogp_training_results.json",
+             "args": {"n_episodes": cpu_eps(200), "grid": grid, "n_drones": n_drones,
+                      "max_steps": max_steps, "use_gat": True, "seed": 42,
+                      "run_id": "gpu_nogp", "use_gp": False, "use_cbf": True}},
+            {"key": "nocbf", "kind": "train", "label": "No-CBF (200 ep)",
+             "result": "gpu_nocbf_training_results.json",
+             "args": {"n_episodes": cpu_eps(200), "grid": grid, "n_drones": n_drones,
+                      "max_steps": max_steps, "use_gat": True, "seed": 42,
+                      "run_id": "gpu_nocbf", "use_gp": True, "use_cbf": False}},
+        ]
+        for s in (42, 123):
+            cpu_jobs.append(
+                {"key": f"mappo_s{s}", "kind": "mappo", "label": f"MAPPO s{s} ({train_eps} ep)",
+                 "result": f"mappo_s{s}_training_results.json",
+                 "args": {"n_episodes": train_eps, "grid": grid, "n_drones": n_drones,
+                          "max_steps": max_steps, "seed": s}})
+        for s in (42, 123):
+            cpu_jobs.append(
+                {"key": f"ippo_s{s}", "kind": "ippo", "label": f"IPPO s{s} ({cpu_eps(400)} ep)",
+                 "result": f"ippo_s{s}_training_results.json",
+                 "args": {"n_episodes": cpu_eps(400), "grid": grid, "n_drones": n_drones,
+                          "max_steps": max_steps, "seed": s}})
+    pool_results = {}
+    pool_thread = None
+    if (parallel and cpu_jobs and (os.cpu_count() or 1) > 1
+            and os.environ.get("PIPELINE_PARALLEL", "1") != "0"):
+        n_workers = (n_cpu_workers if n_cpu_workers
+                     else min(len(cpu_jobs), max(1, (os.cpu_count() or 1) - 1)))
+        print(f"  Parallel layout: {len(cpu_jobs)} CPU ablation trainings across "
+              f"{n_workers} worker(s), running while the GPU seeds train.",
+              flush=True)
+        pool_thread = threading.Thread(
+            target=_cpu_job_pool_worker, args=(cpu_jobs, n_workers, pool_results),
+            daemon=True)
+        pool_thread.start()
+    if fast:
+        print("  FAST MODE: CPU ablation trainings (No-GP / No-CBF / MAPPO / IPPO) "
+              "are SKIPPED. Run gpu_run_full_pipeline(fast=False) for the full "
+              "9-method table.", flush=True)
     
     # ═══ PHASE 1: Train GAT-ITSE × 3 seeds (GPU) ═══
     print("\n" + "=" * 60, flush=True)
@@ -1561,31 +1697,29 @@ def gpu_run_full_pipeline():
                                use_gat=False, seed=seed, run_id=f"gpu_nogat_s{seed}")
         nogat_results.append(res)
     
-    # No-GP and No-CBF use CPU training (require per-step GP/CBF logic)
-    print("\n  Training No-GP ablation (CPU)...", flush=True)
-    _, nogp_res = train(200, grid, n_drones, max_steps, use_gat=True, seed=42,
-                        run_id="gpu_nogp", use_gp=False, use_cbf=True)
-    print("  Training No-CBF ablation (CPU)...", flush=True)
-    _, nocbf_res = train(200, grid, n_drones, max_steps, use_gat=True, seed=42,
-                         run_id="gpu_nocbf", use_gp=True, use_cbf=False)
-    
-    # ═══ PHASE 3: Train MAPPO (CPU) ═══
-    print("\n" + "=" * 60, flush=True)
-    print("PHASE 3: Training MAPPO × 2 seeds", flush=True)
-    print("=" * 60, flush=True)
-    mappo_res = []
-    for seed in [42, 123]:
-        _, res = train_mappo(train_eps, grid, n_drones, max_steps, seed=seed)
-        mappo_res.append(res)
-    
-    # ═══ PHASE 4: Train IPPO (CPU) ═══
-    print("\n" + "=" * 60, flush=True)
-    print("PHASE 4: Training IPPO × 2 seeds", flush=True)
-    print("=" * 60, flush=True)
-    ippo_res = []
-    for seed in [42, 123]:
-        _, res = train_ippo(400, grid, n_drones, max_steps, seed=seed)
-        ippo_res.append(res)
+    # No-GP / No-CBF / MAPPO / IPPO are the single-env CPU trainings. In the
+    # default (parallel) layout they were launched above and keep running while
+    # the GPU seeds AND the batched-env baseline phases below execute; just
+    # before results are aggregated (below) we join the pool and read each
+    # job's results JSON - byte-identical to a sequential run. When fast=True
+    # these variables stay empty and the table / stats / figure phases
+    # tolerate the absence of those rows.
+    nogp_res = nocbf_res = None
+    mappo_res, ippo_res = [], []
+    if cpu_jobs and pool_thread is None and not fast:
+        # Sequential fallback (parallel=False / single-core / PIPELINE_PARALLEL=0):
+        # exactly the original pipeline's in-process order.            print("\n  Training No-GP ablation (CPU)...", flush=True)
+            _, nogp_res = train(cpu_eps(200), grid, n_drones, max_steps, use_gat=True, seed=42,
+                                run_id="gpu_nogp", use_gp=False, use_cbf=True)
+            print("  Training No-CBF ablation (CPU)...", flush=True)
+            _, nocbf_res = train(cpu_eps(200), grid, n_drones, max_steps, use_gat=True, seed=42,
+                                 run_id="gpu_nocbf", use_gp=True, use_cbf=False)
+            for seed in [42, 123]:
+                _, res = train_mappo(train_eps, grid, n_drones, max_steps, seed=seed)
+                mappo_res.append(res)
+            for seed in [42, 123]:
+                _, res = train_ippo(cpu_eps(400), grid, n_drones, max_steps, seed=seed)
+                ippo_res.append(res)
     
     # ═══ PHASE 5: Non-learned baselines ═══
     print("\n" + "=" * 60, flush=True)
@@ -1603,6 +1737,42 @@ def gpu_run_full_pipeline():
                            n_envs=n_envs, n_eps=20, seed=4242)
     
     # ═══ AGGREGATE ALL RESULTS ═══
+    # Join the parallel CPU-job pool (started before Phase 1) and read back
+    # each finished job's results JSON. No-op in sequential / fast modes.
+    if pool_thread is not None:
+        while pool_thread.is_alive():
+            time.sleep(15)
+        pool_thread.join()
+        for job in cpu_jobs:
+            path = pool_results.get(job["key"])
+            res = None
+            if path and os.path.exists(path):
+                with open(path) as f:
+                    res = json.load(f)
+            if res is None:
+                print(f"  [!] no results for {job['label']} - row omitted",
+                      flush=True)
+            if job["kind"] == "train":
+                if job["key"] == "nogp":
+                    nogp_res = res
+                else:
+                    nocbf_res = res
+            elif job["kind"] == "mappo":
+                if res is not None:
+                    mappo_res.append(res)
+            else:
+                if res is not None:
+                    ippo_res.append(res)
+        summary = (f"  CPU ablations done -> No-GP: "
+                   f"{nogp_res['final_coverage']:.1f}%" if nogp_res else "  CPU ablations done -> No-GP: -") 
+        if nocbf_res:
+            summary += f"% | No-CBF: {nocbf_res['final_coverage']:.1f}%"
+        if mappo_res:
+            summary += (" | MAPPO: " + ", ".join(f"{r['final_coverage']:.1f}%" for r in mappo_res))
+        if ippo_res:
+            summary += (" | IPPO: " + ", ".join(f"{r['final_coverage']:.1f}%" for r in ippo_res))
+        print(summary, flush=True)
+    
     all_results = {}
     
     gat_covs = [r['final_coverage'] for r in gat_results]
@@ -1622,27 +1792,31 @@ def gpu_run_full_pipeline():
     }
     
     for name, res_data in [('No-GP', nogp_res), ('No-CBF', nocbf_res)]:
+        if res_data is None:
+            continue
         all_results[name] = {
             'coverage': res_data['final_coverage'], 'coverage_std': 0,
             'safety': res_data['final_safety'], 'safety_std': 0,
             'coverages': [res_data['final_coverage']],
         }
     
-    mappo_covs = [r['final_coverage'] for r in mappo_res]
-    mappo_safs = [r['final_safety'] for r in mappo_res]
-    all_results['MAPPO'] = {
-        'coverage': float(np.mean(mappo_covs)), 'coverage_std': float(np.std(mappo_covs)),
-        'safety': float(np.mean(mappo_safs)), 'safety_std': float(np.std(mappo_safs)),
-        'coverages': mappo_covs,
-    }
+    if mappo_res:
+        mappo_covs = [r['final_coverage'] for r in mappo_res]
+        mappo_safs = [r['final_safety'] for r in mappo_res]
+        all_results['MAPPO'] = {
+            'coverage': float(np.mean(mappo_covs)), 'coverage_std': float(np.std(mappo_covs)),
+            'safety': float(np.mean(mappo_safs)), 'safety_std': float(np.std(mappo_safs)),
+            'coverages': mappo_covs,
+        }
     
-    ippo_covs = [r['final_coverage'] for r in ippo_res]
-    ippo_safs = [r['final_safety'] for r in ippo_res]
-    all_results['IPPO'] = {
-        'coverage': float(np.mean(ippo_covs)), 'coverage_std': float(np.std(ippo_covs)),
-        'safety': float(np.mean(ippo_safs)), 'safety_std': float(np.std(ippo_safs)),
-        'coverages': ippo_covs,
-    }
+    if ippo_res:
+        ippo_covs = [r['final_coverage'] for r in ippo_res]
+        ippo_safs = [r['final_safety'] for r in ippo_res]
+        all_results['IPPO'] = {
+            'coverage': float(np.mean(ippo_covs)), 'coverage_std': float(np.std(ippo_covs)),
+            'safety': float(np.mean(ippo_safs)), 'safety_std': float(np.std(ippo_safs)),
+            'coverages': ippo_covs,
+        }
     
     for name, res_data in [('Random', random_res), ('Greedy', greedy_res), ('PID', pid_res)]:
         all_results[name] = res_data
@@ -1652,7 +1826,9 @@ def gpu_run_full_pipeline():
     print(f"{'Method':<15s} {'Safety':>10s} {'Coverage':>10s}", flush=True)
     print(f"{'-' * 70}", flush=True)
     for m in ['GAT-ITSE', 'No-GAT', 'No-GP', 'No-CBF', 'MAPPO', 'IPPO', 'Random', 'Greedy', 'PID']:
-        r = all_results.get(m, {})
+        if m not in all_results:
+            continue
+        r = all_results[m]
         print(f"{m:<15s} {r.get('safety', 0):>8.1f}% {r.get('coverage', 0):>8.1f}%", flush=True)
     print(f"{'=' * 70}", flush=True)
     
@@ -1736,6 +1912,10 @@ def gpu_run_full_pipeline():
         'wind_robustness': {str(k): v for k, v in wind_results.items()},
         'scalability': {k: {str(kk): vv for kk, vv in v.items()} for k, v in scalability_results.items()},
     }
+    if fast:
+        # Tag the artifact so a fast (CPU-ablation-free) run is never mistaken
+        # for the full 9-method publishable table.
+        final_results['mode'] = 'fast'
     with open('gpu_benchmark_results.json', 'w') as f:
         json.dump(final_results, f, indent=2)
     
@@ -1747,4 +1927,12 @@ def gpu_run_full_pipeline():
 
 
 if __name__ == "__main__":
-    gpu_run_full_pipeline()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--cpu-job":
+        # Subprocess entry for a parallel CPU ablation training.
+        _cpu_job_main(sys.argv[2])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--fast":
+        gpu_run_full_pipeline(fast=True)
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--sequential":
+        gpu_run_full_pipeline(parallel=False)
+    else:
+        gpu_run_full_pipeline()

@@ -218,7 +218,12 @@ class WildfireEnv:
 
     def step(self, actions):
         self.step_count += 1
-        rng = np.random.default_rng()
+        # Fire-spread noise must be seed-locked, otherwise every run draws a
+        # fresh OS-entropy stream here and identical (seed, code) training runs
+        # diverge - even twice in the same interpreter. Seeding by step_count
+        # makes rollouts bit-reproducible across runs/sessions/machines
+        # (mirrors plumegym_marl/wildfire_env.py).
+        rng = np.random.default_rng(self.step_count)
         dones = np.zeros(self.n_drones, dtype=bool)
         infos = [{} for _ in range(self.n_drones)]
         for i in range(self.n_drones):
