@@ -35,6 +35,10 @@ else:
 np.random.seed(42)
 torch.manual_seed(42)
 
+# Strength of the goal-steer action bias (see GoalBiasPolicy). 0.0 = pure
+# learned goal-conditioning (the calibrated baseline); tuned per experiment.
+GOAL_STEER_BETA = 0.0
+
 
 # ═══════════════════════════════════════════════════════════════
 # SECTION 1: GPU-VECTORIZED ENVIRONMENT
@@ -553,6 +557,57 @@ from kaggle_full_run import (
 # SECTION 3: BATCHED AGENT
 # ═══════════════════════════════════════════════════════════════
 
+class GoalBiasPolicy(nn.Module):
+    """PPONetwork + a fixed steering prior over the 5 discrete actions.
+
+    The last 4 dims of the input are the waypoint embedding (cy, cx, dy, dx)
+    where (dy, dx) = clamp(waypoint_center - own_pos, -1, 1) in map-normalized
+    units. The policy's action logits get a non-learned additive term
+    beta * dot(action_delta, toward), so movement is biased toward the chosen
+    frontier sector. The learned net sits on top and can override the bias
+    (avoid fire, crowding, etc.) — but goal-following no longer depends on PPO
+    discovering it through diffuse exploration credit (which it never did).
+
+    forward/evaluate recompute the SAME bias from the stored input, so the
+    log-probs used at selection time and at PPO update time stay consistent.
+    """
+
+    def __init__(self, net, steer_beta=None, act_deltas=None):
+        if steer_beta is None:
+            steer_beta = GOAL_STEER_BETA
+        super().__init__()
+        self.net = net
+        self.steer_beta = steer_beta
+        # 5 discrete actions, order = env.action_deltas: 0 = stay,
+        # 1 = (0,+1), 2 = (0,-1), 3 = (+1,0), 4 = (-1,0) in the same
+        # (x=col, y=row) frame the env applies to drone_pos.
+        if act_deltas is None:
+            act_deltas = [[0, 0], [0, 1], [0, -1], [1, 0], [-1, 0]]
+        self.register_buffer('_deltas', torch.tensor(act_deltas, dtype=torch.float32))
+
+    def _steer(self, obs):
+        # obs: (..., n) with n >= 4; last 4 dims = (cy, cx, dy, dx)
+        embed = obs[..., -4:]
+        dx = embed[..., 3]            # toward waypoint, x (col) axis
+        dy = embed[..., 2]            # toward waypoint, y (row) axis
+        norm = torch.sqrt(dx * dx + dy * dy).clamp(min=1e-3)
+        ux = dx / norm
+        uy = dy / norm
+        # (…, 5) dot products of each action delta with the unit toward vector
+        steer = (self._deltas[:, 0] * ux.unsqueeze(-1)
+                 + self._deltas[:, 1] * uy.unsqueeze(-1))
+        return self.steer_beta * steer
+
+    def forward(self, obs):
+        logits, values = self.net(obs)
+        return logits + self._steer(obs), values
+
+    def evaluate(self, obs, actions):
+        logits, values = self.forward(obs)
+        dist = torch.distributions.Categorical(logits=logits)
+        return logits, dist.log_prob(actions), dist.entropy(), values
+
+
 class BatchedGATPPO:
     """PPO agent that processes all N environments × K agents in batched fashion.
     
@@ -561,14 +616,41 @@ class BatchedGATPPO:
     GAT and policy networks.
     """
     
-    def __init__(self, obs_dim, act_dim=5, use_gat=True, lr=2e-4, comm_range=10.0):
+    def __init__(self, obs_dim, act_dim=5, use_gat=True, lr=2e-4, comm_range=10.0,
+                 map_cue_size=6, global_base_dim=10):
         if use_gat:
             self.gat = GATCommunication(obs_dim, hidden_dim=128, out_dim=64, comm_range=comm_range).to(device)
         else:
             self.gat = NoGATCommunication(obs_dim, out_dim=64).to(device)
         
-        self.policy = PPONetwork(self.gat.enhanced_obs_dim, act_dim).to(device)
-        params = list(self.gat.parameters()) + list(self.policy.parameters())
+        # ── Frontier waypoint head (goal-conditioned exploration) ──
+        # A small head over the raw map cue + own position emits logits over the
+        # 6×6 sectors of the team-visited map. Every WP_INTERVAL steps each drone
+        # samples a target sector (its "waypoint"); the actor's policy input is
+        # augmented with that target (center + offset), so movement becomes
+        # "head toward region (i,j)" instead of a raw local reactive scan. The
+        # waypoint head is trained with REINFORCE on the drone's own
+        # new-cell credit (its block return), so it learns to pick the sectors
+        # where exploration actually pays — the mechanism random wandering
+        # exploits implicitly and a memoryless reactive policy lacks.
+        self.map_cue_size = map_cue_size
+        self.global_base_dim = global_base_dim
+        self.cue_dim = map_cue_size * map_cue_size
+        # obs layout (built in GPUWildfireEnv._get_obs): local patch, then
+        # global_base_dim global features (own pos at +0/+1), then the cue.
+        self._glob_start = obs_dim - (global_base_dim + self.cue_dim)
+        wp_in_dim = 2 + self.cue_dim            # pos_norm + cue
+        self.wp_net = nn.Sequential(
+            nn.Linear(wp_in_dim, 64), nn.ReLU(), nn.LayerNorm(64),
+            nn.Linear(64, self.cue_dim)).to(device)
+        self.wp_interval = 25                    # steps a waypoint is held
+        self.wp_entropy_coef = 0.02
+        self.wp_prior = 3.0                      # init bias toward unvisited sectors
+        # 4 extra policy-input dims: waypoint center + normalized offset from own pos
+        self.policy = GoalBiasPolicy(
+            PPONetwork(self.gat.enhanced_obs_dim + 4, act_dim)).to(device)
+        params = (list(self.gat.parameters()) + list(self.policy.parameters())
+                  + list(self.wp_net.parameters()))
         self.optimizer = torch.optim.Adam(params, lr=lr, eps=1e-5)
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=2000, eta_min=1e-5)
         # Tensor buffers for fast storage (avoids per-element dict creation)
@@ -579,9 +661,47 @@ class BatchedGATPPO:
         self._lp_buf = []
         self._val_buf = []
         self._aid_buf = []
+        # Waypoint buffers (one row per (env, agent) per step, like the others)
+        self._wp_in_buf = []       # wp-net input at each step
+        self._wp_act_buf = []      # sector id governing each step (-1 = dead/none)
+        self._wp_rew_buf = []      # per-step own-new-cell credit (training only)
+        self._wp_act_flat = None   # current waypoint per flattened row
+        self._wp_step = 0          # steps since begin_rollout()
+        self._old_format_policy = False   # True after loading a pre-waypoint ckpt
         self.itse_weight = 0.3
         self.explore_bonus_scale = 2.0
-    
+
+    def begin_rollout(self):
+        """Reset waypoint state at the start of a fresh episode batch."""
+        self._wp_act_flat = None
+        self._wp_step = 0
+        self._wp_in_buf.clear()
+        self._wp_act_buf.clear()
+        self._wp_rew_buf.clear()
+
+    def _select_waypoints(self, wp_in, alive_flat):
+        """Sample a fresh target sector for each alive agent (others get -1)."""
+        with torch.no_grad():
+            logits = self.wp_net(wp_in)
+            # Init-bias: start from "prefer unvisited sectors"; the net learns on top.
+            logits = logits - self.wp_prior * wp_in[:, -self.cue_dim:]
+            dist = torch.distributions.Categorical(logits=logits)
+            wp = dist.sample()
+            wp[~alive_flat] = -1
+            self._wp_act_flat = wp
+
+    def _waypoint_embedding(self, n_rows):
+        """(center_y, center_x, dy, dx) of the current waypoint, in map-normalized units."""
+        idx = self._wp_act_flat.clamp(min=0)
+        sy = (idx // self.map_cue_size).float()
+        sx = (idx % self.map_cue_size).float()
+        cy = (sy + 0.5) / self.map_cue_size
+        cx = (sx + 0.5) / self.map_cue_size
+        pos = self._wp_pos_flat                       # (n, 2) normalized own pos
+        dy = (cy - pos[:, 0]).clamp(-1.0, 1.0)
+        dx = (cx - pos[:, 1]).clamp(-1.0, 1.0)
+        return torch.stack([cy, cx, dy, dx], dim=-1)  # (n, 4)
+
     def select_actions_batched(self, obs, positions, alive_mask, greedy=False):
         """Batched action selection across all envs and agents.
         
@@ -614,6 +734,29 @@ class BatchedGATPPO:
         else:
             enhanced = self.gat(obs_flat, pos_flat, alive_flat)
         
+        # ── Waypoint selection & goal conditioning ──
+        if self._old_format_policy:
+            # Legacy (pre-waypoint) checkpoint: the policy net expects the raw
+            # enhanced obs with no +4 goal-embedding dims, and we skip waypoint
+            # sampling entirely (no extra RNG draws), so replayed evaluation of
+            # an old checkpoint is bit-identical to what the old code produced.
+            pass
+        else:
+            wp_in = torch.cat([obs_flat[..., self._glob_start:self._glob_start + 2],
+                               obs_flat[..., -self.cue_dim:]], dim=-1).detach()   # (n, 2+cue)
+            self._wp_pos_flat = obs_flat[..., self._glob_start:self._glob_start + 2].detach()
+            if ((self._wp_step % self.wp_interval == 0)
+                    or self._wp_act_flat is None
+                    or self._wp_act_flat.shape[0] != N * K):
+                self._select_waypoints(wp_in, alive_flat)
+            self._wp_step += 1
+            # Record (input, governing sector) per step for the waypoint update.
+            self._wp_in_buf.append(wp_in)
+            self._wp_act_buf.append(self._wp_act_flat.clone())
+            # Augment the policy input with the chosen target so movement can be
+            # goal-directed ("head toward sector" rather than a blind local scan).
+            enhanced = torch.cat([enhanced, self._waypoint_embedding(N * K)], dim=-1)
+        
         # Policy forward pass
         with torch.no_grad():
             logits, values = self.policy(enhanced)
@@ -641,12 +784,15 @@ class BatchedGATPPO:
         
         return actions, log_probs, values, enhanced_obs
     
-    def store_batched(self, enhanced_obs, actions, rewards, dones, log_probs, values):
+    def store_batched(self, enhanced_obs, actions, rewards, dones, log_probs, values,
+                      waypoint_reward=None):
         """Store transitions from all N environments using on-device tensor buffers.
         
         Replaces per-element dict creation with batch tensor ops and avoids a
         per-step GPU→CPU round trip (update() concatenates straight from the buffer).
         Each stored row is one (env, agent) transition; rows are stacked per step.
+        waypoint_reward: optional per-agent new-cell credit used by the waypoint
+        head's REINFORCE update (training only).
         """
         # Flatten N×K to a single batch dim (row = env * K + agent)
         self._obs_buf.append(enhanced_obs.detach().reshape(-1, enhanced_obs.shape[-1]))
@@ -655,7 +801,64 @@ class BatchedGATPPO:
         self._done_buf.append(dones.reshape(-1))
         self._lp_buf.append(log_probs.reshape(-1))
         self._val_buf.append(values.reshape(-1))
+        if waypoint_reward is not None:
+            self._wp_rew_buf.append(waypoint_reward.reshape(-1).detach())
     
+    def _wp_loss(self):
+        """REINFORCE-with-baseline loss for the waypoint head.
+
+        Blocks = maximal runs of steps governed by one sampled sector. Each block's
+        return is the agent's own new-cell credit over those steps; advantage is the
+        block return minus that agent's mean block return for the rollout. The head
+        therefore learns to choose the sectors whose pursuit actually yields fresh
+        ground. Only alive-governed blocks contribute (dead rows carry sector -1).
+        """
+        if not self._wp_act_buf or not self._wp_rew_buf:
+            return None
+        S = len(self._wp_act_buf)
+        wp_in_all = torch.cat(self._wp_in_buf, dim=0)     # (S*M, wp_in_dim)
+        wp_act_all = torch.cat(self._wp_act_buf, dim=0)   # (S*M,)
+        wp_rew_all = torch.cat(self._wp_rew_buf, dim=0)   # (S*M,)
+        n = wp_act_all.shape[0]
+        M = n // S
+        A = wp_act_all.reshape(M, S)
+        Rw = wp_rew_all.reshape(M, S)
+        self._wp_in_buf.clear()
+        self._wp_act_buf.clear()
+        self._wp_rew_buf.clear()
+        in_rows, acts, advs = [], [], []
+        for r in range(M):
+            ar = A[r]
+            if int(ar[0].item()) < 0:
+                continue                              # row dead (or never selected)
+            change = (ar[1:] != ar[:-1]).nonzero(as_tuple=False).flatten()
+            bnd = [0] + (change + 1).tolist() + [S]
+            row_in, row_act, row_ret = [], [], []
+            for b in range(len(bnd) - 1):
+                s0, s1 = bnd[b], bnd[b + 1]
+                a = int(ar[s0].item())
+                if a < 0:
+                    continue
+                row_in.append(wp_in_all[r * S + s0])
+                row_act.append(a)
+                row_ret.append(Rw[r, s0:s1].sum())
+            if not row_ret:
+                continue
+            rets = torch.stack(row_ret)
+            in_rows.append(torch.stack(row_in))
+            acts.append(torch.tensor(row_act, device=device))
+            advs.append(rets - rets.mean())
+        if not acts:
+            return None
+        X = torch.cat(in_rows)
+        Ac = torch.cat(acts)
+        Ad = torch.cat(advs)
+        logits = self.wp_net(X)
+        dist = torch.distributions.Categorical(logits=logits)
+        lp = dist.log_prob(Ac)
+        ent = dist.entropy().mean()
+        return -(lp * Ad).mean() - self.wp_entropy_coef * ent
+
     def update(self, gamma=0.99, gae_lambda=0.95, n_epochs=3, batch_size=2048, clip_eps=0.2, entropy_coef=0.02):
         """PPO update using on-device tensor buffers.
         
@@ -665,9 +868,13 @@ class BatchedGATPPO:
         across the independent parallel environments (which injected cross-env
         value noise into every advantage and destabilized training). Fully
         vectorized, no per-transition .item() / GPU-CPU sync.
+
+        The frontier waypoint head is updated in the same call (REINFORCE on
+        per-block exploration credit — see _wp_loss).
         """
         if not self._obs_buf:
             return 0.0
+        wp_loss = self._wp_loss()
         
         S = len(self._obs_buf)          # rollout steps
         # Per-step stacked rows, step-major (used for the minibatch training)
@@ -726,7 +933,7 @@ class BatchedGATPPO:
         all_adv = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         total_loss, count = 0.0, 0
-        all_params = list(self.gat.parameters()) + list(self.policy.parameters())
+        all_params = list(self.gat.parameters()) + list(self.policy.parameters()) + list(self.wp_net.parameters())
         
         for _ in range(n_epochs):
             perm = torch.randperm(n, device=device)
@@ -744,16 +951,46 @@ class BatchedGATPPO:
                 total_loss += loss.item()
                 count += 1
         
+        # Waypoint-head update step (separate gradients; disjoint params)
+        if wp_loss is not None:
+            self.optimizer.zero_grad()
+            wp_loss.backward()
+            nn.utils.clip_grad_norm_(self.wp_net.parameters(), 0.5)
+            self.optimizer.step()
+        
         self.scheduler.step()
         return total_loss / max(1, count)
     
     def save(self, path):
-        torch.save({'gat': self.gat.state_dict(), 'policy': self.policy.state_dict()}, path)
+        torch.save({'gat': self.gat.state_dict(), 'policy': self.policy.state_dict(),
+                    'wp_net': self.wp_net.state_dict()}, path)
     
     def load(self, path):
+        """Load a checkpoint, tolerating both current and pre-waypoint formats.
+
+        Current checkpoints carry the GoalBiasPolicy under 'net.*' plus 'wp_net'.
+        Legacy checkpoints (committed 6798a2d and earlier, e.g. from a Kaggle run
+        started before the waypoint head existed) carry a plain PPONetwork with the
+        raw 596-dim enhanced obs and no wp_net. Those are detected by the missing
+        'net.' prefix, rebuilt at the legacy input width, and evaluated exactly as
+        the old code would (waypoint handling disabled — see select_actions_batched).
+        """
         ckpt = torch.load(path, map_location=device)
         self.gat.load_state_dict(ckpt['gat'])
-        self.policy.load_state_dict(ckpt['policy'])
+        pol = ckpt['policy']
+        if any(k.startswith('net.') for k in pol):
+            # current format (GoalBiasPolicy wrapping PPONetwork)
+            self.policy.load_state_dict(pol)
+            if 'wp_net' in ckpt:
+                self.wp_net.load_state_dict(ckpt['wp_net'])
+            self._old_format_policy = False
+        else:
+            # legacy format: plain PPONetwork, no goal-conditioning dims
+            act_dim = int(pol['policy_head.weight'].shape[0])
+            inner = PPONetwork(self.gat.enhanced_obs_dim, act_dim).to(device)
+            inner.load_state_dict(pol)
+            self.policy = inner
+            self._old_format_policy = True
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -768,7 +1005,8 @@ class BatchedGATPPO:
 # ────────────────────────────────────────────────────────────────────
 
 def _run_batched_rollouts(action_fn, grid=30, n_drones=10, max_steps=300,
-                          n_envs=32, n_eps=None, wind=0.0, seed=None):
+                          n_envs=32, n_eps=None, wind=0.0, seed=None,
+                          return_lists=False):
     """Run n_eps fresh episodes in the batched env using action_fn(o, env).
 
     Every (env, drone) resets from the same seeded stream, so calling with the
@@ -789,6 +1027,9 @@ def _run_batched_rollouts(action_fn, grid=30, n_drones=10, max_steps=300,
         env = GPUWildfireEnv(n_envs=b, grid=grid, n_drones=n_drones,
                              max_steps=max_steps, wind_speed=wind)
         o = env.reset()
+        rh = getattr(action_fn, 'reset', None)
+        if rh is not None:
+            rh()
         for _ in range(max_steps):
             if not env.drone_alive.any():
                 break
@@ -801,6 +1042,8 @@ def _run_batched_rollouts(action_fn, grid=30, n_drones=10, max_steps=300,
         safes.extend((env.drone_alive.sum(dim=1).float()
                       / n_drones * 100).cpu().tolist())
         eps_done += b
+    if return_lists:
+        return covs, safes
     return (float(np.mean(covs)), float(np.std(covs)),
             float(np.mean(safes)), float(np.std(safes)))
 
@@ -849,6 +1092,64 @@ def _pid_baseline_actions(o, env):
     return a
 
 
+def _frontier_oracle_actions(o, env):
+    """Adaptive-frontier replanner oracle (perfect information).
+
+    Every step each drone targets the nearest cell that is (unvisited AND safe:
+    fire_dist >= 1.2, thermal below cap) inside its own row band (deconfliction),
+    falling back to the global nearest safe unvisited cell when its band is
+    exhausted. Moves by hill-climbing the Manhattan distance to that target with
+    the 5 discrete actions, never landing in a dangerous cell (retreats along the
+    least-dangerous step if surrounded).
+
+    This is the strong non-learning baseline that defines the environment's
+    coverage-safety ceiling: it maximizes coverage subject to safety, so it is
+    the bar a learned swarm must approach.
+    """
+    N, G, K = env.n_envs, env.grid, env.n_drones
+    band = max(1, G // K)
+    xs = torch.arange(G, device=device).float()
+    row_idx = torch.arange(G, device=device).view(1, 1, G, 1)
+    visited = env.shared_visited.unsqueeze(1)                      # (N,1,G,G)
+    safe = (visited < 0.5) & (env.fire_dist.unsqueeze(1) >= 1.2) \
+        & (env.thermal.unsqueeze(1) < env.thermal_cap * 0.95)
+    kk = torch.arange(K, device=device).view(1, K, 1, 1)
+    band_rows = (row_idx >= kk * band) & (row_idx < kk * band + band)
+    band_safe = safe & band_rows
+    px = env.drone_pos[:, :, 0].clamp(0, G - 1)
+    py = env.drone_pos[:, :, 1].clamp(0, G - 1)
+    dx = (px.view(N, K, 1, 1) - xs.view(1, 1, 1, G)).abs()
+    dy = (py.view(N, K, 1, 1) - row_idx.float().squeeze(-1).view(1, 1, G, 1)).abs()
+    dist = dx + dy                                                 # (N,K,G,G)
+    use_band = band_safe.any(dim=(-2, -1), keepdim=True)
+    mask = torch.where(use_band, band_safe, safe)
+    d_masked = torch.where(mask, dist, torch.full_like(dist, float('inf')))
+    targ = d_masked.reshape(N, K, -1).argmin(dim=-1)
+    tx = (targ % G).long(); ty = (targ // G).long()
+    ix = px.long(); iy = py.long()
+    dd = env.action_deltas.float()
+    lx = ix.unsqueeze(-1) + dd[:, 0].view(1, 1, 5)
+    ly = iy.unsqueeze(-1) + dd[:, 1].view(1, 1, 5)
+    ok = (lx >= 0) & (lx < G) & (ly >= 0) & (ly < G) & env.drone_alive.unsqueeze(-1)
+    lx_c = lx.clamp(0, G - 1).long(); ly_c = ly.clamp(0, G - 1).long()
+    ei = torch.arange(N, device=device).view(N, 1, 1).expand(N, K, 5)
+    lfd = env.fire_dist[ei, ly_c, lx_c]
+    lth = env.thermal[ei, ly_c, lx_c]
+    land_safe = ok & (lfd >= 1.2) & (lth < env.thermal_cap * 0.95)
+    stay = torch.zeros(N, K, 1, dtype=torch.bool, device=device)
+    land_safe = land_safe | (stay & env.drone_alive.unsqueeze(-1))
+    cur = (px - tx.float()).abs() + (py - ty.float()).abs()
+    nd = ((ix.unsqueeze(-1) + dd[:, 0].long().view(1, 1, 5)) - tx.unsqueeze(-1)).float().abs() \
+         + ((iy.unsqueeze(-1) + dd[:, 1].long().view(1, 1, 5)) - ty.unsqueeze(-1)).float().abs()
+    score = torch.where(land_safe, cur.unsqueeze(-1) - nd, torch.full_like(nd, -1e9))
+    a = score.argmax(dim=-1)
+    no_safe = ~land_safe.any(dim=-1)
+    fallback = torch.where(ok, lfd, torch.full_like(lfd, 1e9)).argmin(dim=-1)
+    a = torch.where(no_safe, fallback, a)
+    a[~env.drone_alive] = 0
+    return a
+
+
 def _trained_agent_actions(agent, greedy=False):
     """Action fn for a trained agent checkpoint.
 
@@ -864,6 +1165,8 @@ def _trained_agent_actions(agent, greedy=False):
             acts, _, _, _ = agent.select_actions_batched(
                 o, env.drone_pos, env.drone_alive, greedy=greedy)
         return acts
+    # Reset per-episode waypoint state at every fresh env batch in rollouts.
+    fn.reset = agent.begin_rollout
     return fn
 
 
@@ -874,6 +1177,145 @@ def _eval_result(action_fn, grid=30, n_drones=10, max_steps=300,
         action_fn, grid=grid, n_drones=n_drones, max_steps=max_steps,
         n_envs=n_envs, n_eps=n_eps, wind=wind, seed=seed)
     return {'safety': sm, 'coverage': cm, 'safety_std': ss, 'coverage_std': cs}
+
+
+# ═══════════════════════════════════════════════════════════════
+# RIGOROUS BENCHMARKING — Pareto frontier + RLiable-style stats
+# ═══════════════════════════════════════════════════════════════
+# Multi-seed fresh-episode evaluation with Interquartile Mean (IQM),
+# stratified-bootstrap 95% CIs (RLiable convention), and Welch's t-test +
+# Mann-Whitney U against the random baseline — plus the coverage-vs-safety
+# Pareto plot. Every policy is measured on IDENTICAL fresh episodes.
+
+def _iqm(xs):
+    """Interquartile mean (mean of the middle 50% of samples)."""
+    a = np.sort(np.asarray(xs, dtype=np.float64))
+    n = a.size
+    lo = max(0, n // 4 - 1)
+    hi = min(n, n - n // 4 + 1)
+    return float(a[lo:hi].mean()) if hi > lo else float(a.mean())
+
+
+def _stratified_bootstrap_ci(groups, stat=_iqm, n_boot=2000, seed=0):
+    """95% CI of `stat` via stratified resampling (per env-seed stratum).
+
+    groups: list of per-stratum sample arrays. Each bootstrap draw resamples
+    every stratum with replacement (same size) and pools, then applies stat.
+    """
+    rng = np.random.default_rng(seed)
+    gs = [np.asarray(g, dtype=np.float64) for g in groups]
+    boots = np.empty(n_boot)
+    for b in range(n_boot):
+        pooled = np.concatenate([rng.choice(g, size=g.size, replace=True) for g in gs])
+        boots[b] = stat(pooled)
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def _pareto_summary(checkpoints=None, grid=30, n_drones=10, max_steps=300,
+                    n_envs=32, n_eps=96, wind=0.0, seed=4242, n_boot=2000,
+                    run_id="pareto", fig_path="pareto_frontier.png"):
+    """Benchmark trained checkpoints + baselines + oracle on identical fresh
+    episodes; print an IQM/bootstrap/significance table and save a Pareto plot.
+
+    checkpoints: list of (label, path, use_gat) — e.g. ('GAT best s42',
+    'gpu_gat_s42_best.pt', True). Baselines (random/greedy/PID/oracle) are
+    always included. Episodes are grouped into n_envs-sized strata (each shares
+    an env seed) so bootstrap CIs are stratified. Saves <run_id>_pareto.json
+    and the PNG into /kaggle/working (cwd).
+    """
+    import scipy.stats as sp
+    from matplotlib import pyplot as plt
+
+    rows = {}
+    base_fns = [("Random", _random_actions), ("Greedy", _greedy_baseline_actions),
+                ("PID", _pid_baseline_actions), ("FrontierOracle", _frontier_oracle_actions)]
+    for label, fn in base_fns:
+        covs, safes = _run_batched_rollouts(fn, grid=grid, n_drones=n_drones,
+                                            max_steps=max_steps, n_envs=n_envs,
+                                            n_eps=n_eps, wind=wind, seed=seed,
+                                            return_lists=True)
+        rows[label] = (covs, safes)
+    if checkpoints:
+        probe = GPUWildfireEnv(n_envs=2, grid=grid, n_drones=n_drones, max_steps=10)
+        obs_dim = probe.obs_dim
+        for label, path, use_gat in checkpoints:
+            ag = BatchedGATPPO(obs_dim=obs_dim, act_dim=5, use_gat=use_gat)
+            ag.load(path)
+            covs, safes = _run_batched_rollouts(_trained_agent_actions(ag),
+                                                grid=grid, n_drones=n_drones,
+                                                max_steps=max_steps, n_envs=n_envs,
+                                                n_eps=n_eps, wind=wind, seed=seed,
+                                                return_lists=True)
+            rows[label] = (covs, safes)
+
+    # ── stats per policy ──
+    table = {}
+    strat = max(1, n_envs)
+    for label, (covs, safes) in rows.items():
+        cov_groups = [covs[i:i + strat] for i in range(0, len(covs), strat)]
+        safe_groups = [safes[i:i + strat] for i in range(0, len(safes), strat)]
+        cov_lo, cov_hi = _stratified_bootstrap_ci(cov_groups, n_boot=n_boot, seed=42)
+        safe_lo, safe_hi = _stratified_bootstrap_ci(safe_groups, n_boot=n_boot, seed=43)
+        table[label] = {
+            'coverage_mean': float(np.mean(covs)), 'coverage_iqm': _iqm(covs),
+            'coverage_ci': [cov_lo, cov_hi],
+            'safety_mean': float(np.mean(safes)), 'safety_iqm': _iqm(safes),
+            'safety_ci': [safe_lo, safe_hi],
+        }
+    # ── significance vs Random ──
+    rnd_c = np.asarray(rows['Random'][0]); rnd_s = np.asarray(rows['Random'][1])
+    for label in table:
+        if label == 'Random':
+            continue
+        covs = np.asarray(rows[label][0]); safes = np.asarray(rows[label][1])
+        t_c = sp.ttest_ind(covs, rnd_c, equal_var=False)
+        mw_c = sp.mannwhitneyu(covs, rnd_c, alternative='two-sided')
+        t_s = sp.ttest_ind(safes, rnd_s, equal_var=False)
+        mw_s = sp.mannwhitneyu(safes, rnd_s, alternative='two-sided')
+        table[label]['vs_random'] = {
+            'welch_cov_p': float(t_c.pvalue), 'mwu_cov_p': float(mw_c.pvalue),
+            'welch_safe_p': float(t_s.pvalue), 'mwu_safe_p': float(mw_s.pvalue),
+        }
+
+    # ── print ──
+    print("\n=== PARETO & STATISTICS (n=%d fresh episodes/policy, identical envs) ===" % n_eps)
+    hdr = f"{'policy':16s} {'cov mean':>9s} {'cov IQM':>8s} {'cov 95%CI':>18s} {'safe mean':>9s} {'safe IQM':>8s} {'safe 95%CI':>18s} {'vsRandom(cov p)':>15s}"
+    print(hdr); print('-' * len(hdr))
+    for label, t in table.items():
+        vp = t['vs_random']['welch_cov_p'] if 'vs_random' in t else 1.0
+        print(f"{label:16s} {t['coverage_mean']:9.2f} {t['coverage_iqm']:8.2f} "
+              f"[{t['coverage_ci'][0]:7.2f},{t['coverage_ci'][1]:7.2f}] "
+              f"{t['safety_mean']:9.2f} {t['safety_iqm']:8.2f} "
+              f"[{t['safety_ci'][0]:7.2f},{t['safety_ci'][1]:7.2f}] {vp:15.3g}")
+
+    # ── Pareto plot (safety on x, coverage on y; frontier = step line) ──
+    pts = sorted([(t['safety_mean'], t['coverage_mean'], label)
+                  for label, t in table.items()], key=lambda p: p[0])
+    plt.figure(figsize=(8, 6))
+    for sx, cy, label in pts:
+        plt.scatter(sx, cy, s=90, zorder=3)
+        plt.annotate(label, (sx, cy), textcoords="offset points", xytext=(6, 6))
+    # Pareto-optimal set (max coverage for >= given safety): step through left->right
+    best = -1.0
+    frontier = []
+    for sx, cy, label in pts:
+        if cy > best:
+            best = cy
+            frontier.append((sx, cy))
+    if frontier:
+        fx = [p[0] for p in frontier]; fy = [p[1] for p in frontier]
+        plt.step(fx, fy, where='post', ls='--', color='gray', alpha=0.8, label='Pareto frontier')
+    plt.xlabel('Survival (%)'); plt.ylabel('Coverage (%)')
+    plt.title('Coverage–Safety Pareto frontier (identical fresh episodes)')
+    plt.legend(); plt.grid(alpha=0.3)
+    plt.tight_layout(); plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+    plt.close()
+
+    with open(f'{run_id}_pareto.json', 'w') as f:
+        json.dump(table, f, indent=2)
+    print(f"Saved {run_id}_pareto.json and {fig_path}")
+    return table
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -919,6 +1361,7 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
             agent._lp_buf.clear()
             agent._val_buf.clear()
             agent._aid_buf.clear()
+            agent.begin_rollout()
             batch_crashes = torch.zeros(n_envs, n_drones, device=device)
             batch_rewards = torch.zeros(n_envs, device=device)
             batch_coverages = torch.zeros(n_envs, device=device)
@@ -979,8 +1422,9 @@ def batched_train(n_episodes=500, grid=30, n_drones=10, max_steps=300,
                 
                 batch_crashes += crashed.float()
                 
-                # Store transitions
-                agent.store_batched(enhanced, actions, rewards, dones.float(), log_probs, values)
+                # Store transitions (waypoint credit = own new cells, for the wp head)
+                agent.store_batched(enhanced, actions, rewards, dones.float(), log_probs, values,
+                                    waypoint_reward=own_new.float())
                 
                 batch_rewards += rewards.sum(dim=1)
                 obs = obs_next

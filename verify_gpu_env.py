@@ -26,8 +26,11 @@ sys.path.insert(0, ROOT)
 from gpu_accelerated import (GPUWildfireEnv as NewEnv,
                              BatchedGATPPO, batched_train)
 
-# ---- Original module straight from git HEAD (pre-edit reference) ----
-head_src = subprocess.run(['git', 'show', 'HEAD:gpu_accelerated.py'],
+# ---- Original module straight from git, at the last PRE-CUE commit ----
+# (HEAD now contains the 6x6 visited-map cue itself, so comparing against HEAD
+# would be vacuous: both sides would be the 532-dim env. 4afa765 is the last
+# commit with the original 496-dim observation contract this test pins.)
+head_src = subprocess.run(['git', 'show', '4afa765:gpu_accelerated.py'],
                           capture_output=True, text=True, check=True).stdout
 orig_mod = types.ModuleType('gpu_accel_orig_ref')
 orig_mod.__dict__['__file__'] = os.path.join(ROOT, 'gpu_accelerated.py')
