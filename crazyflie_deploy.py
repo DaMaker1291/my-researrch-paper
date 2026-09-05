@@ -1,383 +1,346 @@
 #!/usr/bin/env python3
 """
-Crazyflie 2.1 Sim-to-Real Deployment for MARAHS
-=================================================
+Sim-to-real export + validation for the learned MARAHS grid actors
+===================================================================
 
-Exports trained PyTorch policy to ONNX and deploys on Crazyflie 2.1
-for physical validation of wind-resistant station keeping.
+What this script actually is (corrected):
+-----------------------------------------
+The trained artifacts in this repo are *high-level grid policies*:
+PPONetwork-style MLPs (obs -> 5 discrete scan actions) trained on the
+wildfire perimeter env (``paper_ready_train.WildfireEnv``, obs 656) or the
+kaggle_full_run env (obs 496), optionally fronted by a GAT communication
+layer.  **None of them is a 6-D continuous wind-hold controller.**  A previous
+version of this file fabricated that: it initialized random 6->32->4 weights,
+"exported" them as a trained MARAHS policy, and its companion guide claimed
+"holds position within +/-0.2 m at 25 m/s" — a number no code ever measured.
+That fabrication is removed.
 
-This script:
-1. Loads trained GAT-MARAHS weights
-2. Exports to ONNX format for Crazyflie deployment
-3. Runs sim-to-real validation with wind disturbance
-4. Logs position error statistics for paper
+This script now does two honest things:
 
-Hardware required:
-- Bitcraze Crazyflie 2.1 ($199)
-- Flow deck v2 (optical flow + distance sensor)
-- High-velocity fan (15-25 m/s)
+1. ``--export`` loads a **real checkpoint** (plain actor only: PPO/IPPO/MAPPO
+   policy nets; GAT checkpoints are refused because the actor is only
+   meaningful behind its runtime communication graph) and serializes the
+   actual weights — encoder + LayerNorm + policy head, dimensions read from
+   the checkpoint tensors — to a C header and (if ``onnx`` is installed) an
+   ONNX model.  Nothing is exported unless it came from a ``.pt`` file on
+   disk.
+
+2. ``--benchmark`` measures the loaded actor against hand-crafted baselines
+   (Random, Greedy-frontier) on the **task the checkpoint was trained for**
+   (fresh episodes of the native env, identical seeds per policy), and writes
+   the measured numbers to ``learned_vs_handcrafted.json``.  This is the
+   deployment gate: if the learned actor does not beat the hand-crafted
+   policies on its own task, there is no case for uploading it anywhere.
+
+What this script does NOT do: it does not claim a physical position-hold
+result.  Wind station-keeping at the actuator level is a flight-controller
+problem (see ``macondo_hover.py``); turning a grid actor into an onboard
+decision layer additionally requires an observation bridge (map telemetry ->
+actor obs) and an action->velocity mapping that are not yet defined.  Until
+those exist, the C header produced here is a weights artifact, not a
+flight-ready binary.
 
 Usage:
-    python crazyflie_deploy.py --export       # Export to ONNX
-    python crazyflie_deploy.py --simulate      # Sim-only validation
-    python crazyflie_deploy.py --deploy        # Real hardware (requires Crazyflie)
-
-Reference: https://www.bitcraze.io/products/crazyflie-2-1/
+    python crazyflie_deploy.py --checkpoint ppo_best.pt --export
+    python crazyflie_deploy.py --checkpoint ppo_best.pt --benchmark --episodes 6
 """
-import numpy as np
-import torch
-import time
+import argparse
 import json
 import os
 
-device = torch.device("cpu")
+import numpy as np
+import torch
+
+DEVICE = torch.device("cpu")
 
 
-class CrazyfliePolicy:
+# ═══════════════════════════════════════════════════════════════
+# 1. REAL CHECKPOINT LOADING
+# ═══════════════════════════════════════════════════════════════
+
+def inspect_checkpoint(path):
+    """Return (kind, obs_dim, act_dim) for a checkpoint, or raise.
+
+    kind is 'actor' (standalone PPONetwork), 'mappo' (wrapped policy+critic
+    dicts), 'gat' (needs runtime comm graph), or 'unknown'.
     """
-    Lightweight policy for Crazyflie deployment.
-    
-    Takes 6D state (x, y, vx, vy, wind_x, wind_y) → 4D action (thrust_x, thrust_y, thrust_z, yaw_rate)
-    Uses the same MLP architecture as the training policy but with
-    reduced input for real-time inference on Crazyflie's STM32F4 MCU.
-    """
-    
-    def __init__(self, input_dim=6, hidden_dim=32, output_dim=4):
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        
-        # Simple 2-layer MLP (fits on STM32F4)
-        self.W1 = np.random.randn(input_dim, hidden_dim) * np.sqrt(2.0 / input_dim)
-        self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(hidden_dim, hidden_dim) * np.sqrt(2.0 / hidden_dim)
-        self.b2 = np.zeros(hidden_dim)
-        self.W3 = np.random.randn(hidden_dim, output_dim) * np.sqrt(2.0 / hidden_dim)
-        self.b3 = np.zeros(output_dim)
-    
-    def forward(self, x):
-        """Forward pass: state → action."""
-        h1 = np.maximum(0, x @ self.W1 + self.b1)  # ReLU
-        h2 = np.maximum(0, h1 @ self.W2 + self.b2)  # ReLU
-        out = h2 @ self.W3 + self.b3
-        return out
-    
-    def export_onnx(self, path="crazyflie_policy.onnx"):
-        """Export to ONNX for Crazyflie deployment."""
-        try:
-            import torch.onnx
-            
-            class TorchPolicy(torch.nn.Module):
-                def __init__(self, policy):
-                    super().__init__()
-                    self.W1 = torch.tensor(policy.W1, dtype=torch.float32)
-                    self.b1 = torch.tensor(policy.b1, dtype=torch.float32)
-                    self.W2 = torch.tensor(policy.W2, dtype=torch.float32)
-                    self.b2 = torch.tensor(policy.b2, dtype=torch.float32)
-                    self.W3 = torch.tensor(policy.W3, dtype=torch.float32)
-                    self.b3 = torch.tensor(policy.b3, dtype=torch.float32)
-                
-                def forward(self, x):
-                    h1 = torch.relu(x @ self.W1 + self.b1)
-                    h2 = torch.relu(h1 @ self.W2 + self.b2)
-                    return h2 @ self.W3 + self.b3
-            
-            model = TorchPolicy(self)
-            dummy = torch.randn(1, self.input_dim)
-            torch.onnx.export(model, dummy, path, input_names=["state"], output_names=["action"],
-                            dynamic_axes={"state": {0: "batch"}, "action": {0: "batch"}})
-            print(f"Exported to {path}")
-            print(f"  Input: {self.input_dim}D state vector")
-            print(f"  Output: {self.output_dim}D action vector")
-            print(f"  Params: {self.W1.size + self.b1.size + self.W2.size + self.b2.size + self.W3.size + self.b3.size}")
-            return True
-        except ImportError:
-            print("ONNX export requires torch.onnx. Install with: pip install onnx")
-            return False
-    
-    def export_c_header(self, path="crazyflie_policy.h"):
-        """Export weights as C header for Crazyflie firmware."""
-        lines = [
-            "// Auto-generated MARAHS policy weights for Crazyflie 2.1",
-            "// Input: 6D state, Output: 4D action, Hidden: 32 neurons",
-            "#pragma once",
-            f"#define INPUT_DIM {self.input_dim}",
-            f"#define HIDDEN_DIM {self.hidden_dim}",
-            f"#define OUTPUT_DIM {self.output_dim}",
-            "",
-            "static const float W1[INPUT_DIM][HIDDEN_DIM] = {",
-        ]
-        
-        for i in range(self.input_dim):
-            vals = ", ".join(f"{self.W1[i,j]:.6f}" for j in range(self.hidden_dim))
-            lines.append(f"    {{{vals}}},")
-        lines.append("};")
-        
-        lines.append(f"static const float b1[HIDDEN_DIM] = {{{', '.join(f'{v:.6f}' for v in self.b1)}}};")
-        lines.append("")
-        lines.append(f"static const float W2[HIDDEN_DIM][HIDDEN_DIM] = {{")
-        for i in range(self.hidden_dim):
-            vals = ", ".join(f"{self.W2[i,j]:.6f}" for j in range(self.hidden_dim))
-            lines.append(f"    {{{vals}}},")
-        lines.append("};")
-        
-        lines.append(f"static const float b2[HIDDEN_DIM] = {{{', '.join(f'{v:.6f}' for v in self.b2)}}};")
-        lines.append("")
-        lines.append(f"static const float W3[HIDDEN_DIM][OUTPUT_DIM] = {{")
-        for i in range(self.hidden_dim):
-            vals = ", ".join(f"{self.W3[i,j]:.6f}" for j in range(self.output_dim))
-            lines.append(f"    {{{vals}}},")
-        lines.append("};")
-        
-        lines.append(f"static const float b3[OUTPUT_DIM] = {{{', '.join(f'{v:.6f}' for v in self.b3)}}};")
-        
-        with open(path, 'w') as f:
-            f.write("\n".join(lines))
-        print(f"Exported C header to {path}")
-        return True
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"checkpoint not found: {path}")
+    sd = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(sd, dict):
+        raise ValueError(f"{path}: not a state-dict checkpoint (type {type(sd).__name__})")
+
+    if "gat" in sd:
+        kind, actor = "gat", sd.get("policy", {})
+    elif "critic" in sd and "policy" in sd:
+        kind, actor = "mappo", sd["policy"]
+    elif "policy" in sd:
+        kind, actor = "unknown-wrapped", sd["policy"]
+    else:
+        kind, actor = "actor", sd
+
+    enc = actor.get("encoder.0.weight")
+    head = actor.get("policy_head.weight")
+    if enc is None or head is None:
+        raise ValueError(
+            f"{path}: no PPONetwork-style actor found "
+            f"(encoder.0.weight / policy_head.weight missing; keys={list(sd.keys())[:8]})"
+        )
+    obs_dim = int(enc.shape[1])
+    act_dim = int(head.shape[0])
+    return kind, obs_dim, act_dim
 
 
-def simulate_crazyflie(policy, wind_speed=15.0, duration=30.0, dt=0.02):
-    """
-    Simulate Crazyflie position hold with wind disturbance.
-    
-    This simulates the physical dynamics of a Crazyflie 2.1:
-    - Mass: 27g
-    - Max thrust: 0.6N per motor
-    - Max speed: 3 m/s
-    - Wind susceptibility: high (lightweight)
-    
-    The policy outputs corrective thrust commands to maintain position.
-    """
-    print(f"\n{'='*60}")
-    print(f"Crazyflie Simulation | Wind={wind_speed} m/s | Duration={duration}s")
-    print(f"{'='*60}")
-    
-    # Crazyflie physical parameters
-    mass = 0.027  # kg
-    drag_coeff = 0.005  # N/(m/s)^2
-    max_thrust = 0.6  # N per motor
-    position_error_history = []
-    velocity_history = []
-    thrust_history = []
-    
-    # Initial state
-    pos = np.array([0.0, 0.0])  # Target position
-    vel = np.array([0.0, 0.0])
-    
-    # Wind model (constant + gusts)
-    wind_angle = np.random.uniform(0, 2 * np.pi)
-    wind_base = np.array([wind_speed * np.cos(wind_angle), wind_speed * np.sin(wind_angle)])
-    
-    n_steps = int(duration / dt)
-    for step in range(n_steps):
-        t = step * dt
-        
-        # Wind with gusts
-        gust_x = 0.3 * wind_speed * np.sin(2 * np.pi * 0.5 * t + 1.2)
-        gust_y = 0.3 * wind_speed * np.sin(2 * np.pi * 1.0 * t + 0.7)
-        wind = wind_base + np.array([gust_x, gust_y])
-        
-        # State: relative to target (always 0,0)
-        state = np.array([
-            pos[0], pos[1],  # Position error
-            vel[0], vel[1],  # Velocity
-            wind[0] / 30.0,  # Normalized wind
-            wind[1] / 30.0,
-        ])
-        
-        # Policy inference
-        action = policy.forward(state)
-        
-        # Clip to physical limits
-        thrust = np.clip(action[:2] * 0.1, -max_thrust, max_thrust)
-        
-        # Physics: F = ma → a = F/m
-        drag = -drag_coeff * vel * np.abs(vel)
-        wind_force = 0.5 * wind  # Wind coupling
-        
-        accel = (thrust + drag + wind_force) / mass
-        vel = vel + accel * dt
-        vel = np.clip(vel, -3.0, 3.0)  # Max speed limit
-        pos = pos + vel * dt
-        
-        # Record
-        position_error_history.append(np.linalg.norm(pos))
-        velocity_history.append(np.linalg.norm(vel))
-        thrust_history.append(np.linalg.norm(thrust))
-    
-    # Statistics
-    pos_err = np.array(position_error_history)
-    vel_arr = np.array(velocity_history)
-    
-    stats = {
-        'wind_speed': wind_speed,
-        'duration': duration,
-        'mean_error': float(np.mean(pos_err)),
-        'max_error': float(np.max(pos_err)),
-        'rms_error': float(np.sqrt(np.mean(pos_err**2))),
-        'mean_velocity': float(np.mean(vel_arr)),
-        'max_velocity': float(np.max(vel_arr)),
-        'position_std': float(np.std(pos_err)),
+def load_actor(path):
+    """Load a plain PPONetwork actor from a checkpoint. GAT refused."""
+    from ppo_train import PPONetwork
+
+    kind, obs_dim, act_dim = inspect_checkpoint(path)
+    if kind == "gat":
+        raise ValueError(
+            f"{path}: GAT checkpoint — its actor consumes graph-enhanced obs "
+            f"and is meaningless without the runtime comm graph; C/ONNX export "
+            f"of the standalone MLP would silently change the policy. Refusing."
+        )
+    sd = torch.load(path, map_location="cpu", weights_only=False)
+    actor_sd = sd.get("policy", sd) if kind in ("mappo", "unknown-wrapped") else sd
+    net = PPONetwork(obs_dim=obs_dim, act_dim=act_dim)
+    net.load_state_dict(actor_sd)
+    net.eval()
+    return net, kind, obs_dim, act_dim
+
+
+# ═══════════════════════════════════════════════════════════════
+# 2. EXPORT OF REAL WEIGHTS
+# ═══════════════════════════════════════════════════════════════
+
+def export_onnx(net, obs_dim, path):
+    """Export the real actor to ONNX. Fails loudly if onnx is not installed."""
+    try:
+        import torch.onnx  # noqa: F401  (import surfaces the onnx dependency)
+        dummy = torch.randn(1, obs_dim, dtype=torch.float32)
+        torch.onnx.export(
+            net, dummy, path,
+            input_names=["obs"], output_names=["logits"],
+            dynamic_axes={"obs": {0: "batch"}, "logits": {0: "batch"}},
+            opset_version=12,
+        )
+    except Exception as e:  # onnx missing or export failure
+        raise RuntimeError(
+            f"ONNX export failed ({type(e).__name__}: {e}). "
+            f"The onnx package is required: pip install onnx"
+        ) from e
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError(f"ONNX export claimed success but {path} is missing/empty")
+    print(f"Exported real actor -> ONNX: {path} ({os.path.getsize(path)} bytes)")
+
+
+def _layer_norm_params(actor_sd, idx):
+    """Return (gamma, beta) for LayerNorm at encoder.{idx}.weight/bias."""
+    return (actor_sd[f"encoder.{idx}.weight"].numpy(),
+            actor_sd[f"encoder.{idx}.bias"].numpy())
+
+
+def export_c_header(net, obs_dim, act_dim, path, source_pt):
+    """Serialize the *real* actor weights (incl. LayerNorm) to a C header."""
+    actor_sd = net.state_dict()
+    w1 = actor_sd["encoder.0.weight"].numpy()   # (256, obs_dim)
+    b1 = actor_sd["encoder.0.bias"].numpy()
+    ln1g, ln1b = _layer_norm_params(actor_sd, 2)
+    w2 = actor_sd["encoder.3.weight"].numpy()   # (128, 256)
+    b2 = actor_sd["encoder.3.bias"].numpy()
+    ln2g, ln2b = _layer_norm_params(actor_sd, 5)
+    wp = actor_sd["policy_head.weight"].numpy()  # (act_dim, 128)
+    bp = actor_sd["policy_head.bias"].numpy()
+    h1, h2 = w1.shape[0], w2.shape[0]
+
+    def fmt(a):
+        return ", ".join(f"{v:.9g}f" for v in a.ravel())
+
+    lines = [
+        "// Auto-generated from REAL checkpoint weights — do not edit.",
+        f"// Source: {source_pt}",
+        "// PPONetwork grid actor (MARAHS wildfire lineage):",
+        "//   obs -> Linear(obs,256)+ReLU+LayerNorm -> Linear(256,128)+ReLU+LayerNorm",
+        "//       -> policy_head(128, act) logits. LayerNorm eps = 1e-5.",
+        "// NOTE: this is the high-level decision actor (grid obs -> discrete action).",
+        "// It is NOT a low-level wind-hold controller; the observation bridge to",
+        "// real telemetry is not yet defined (see module docstring).",
+        "#pragma once",
+        f"#define POLICY_INPUT_DIM {obs_dim}",
+        f"#define POLICY_HIDDEN1_DIM {h1}",
+        f"#define POLICY_HIDDEN2_DIM {h2}",
+        f"#define POLICY_ACT_DIM {act_dim}",
+        "#define POLICY_LN_EPS 1e-5f",
+        "",
+        f"static const float W1[{h1}][{obs_dim}] = {{",
+    ]
+    for i in range(h1):
+        lines.append(f"    {{{fmt(w1[i])}}},")
+    lines.append("};")
+    lines.append(f"static const float b1[{h1}] = {{{fmt(b1)}}};")
+    lines.append(f"static const float ln1_gamma[{h1}] = {{{fmt(ln1g)}}};")
+    lines.append(f"static const float ln1_beta[{h1}] = {{{fmt(ln1b)}}};")
+    lines.append("")
+    lines.append(f"static const float W2[{h2}][{h1}] = {{")
+    for i in range(h2):
+        lines.append(f"    {{{fmt(w2[i])}}},")
+    lines.append("};")
+    lines.append(f"static const float b2[{h2}] = {{{fmt(b2)}}};")
+    lines.append(f"static const float ln2_gamma[{h2}] = {{{fmt(ln2g)}}};")
+    lines.append(f"static const float ln2_beta[{h2}] = {{{fmt(ln2b)}}};")
+    lines.append("")
+    lines.append(f"static const float Wp[{act_dim}][{h2}] = {{")
+    for i in range(act_dim):
+        lines.append(f"    {{{fmt(wp[i])}}},")
+    lines.append("};")
+    lines.append(f"static const float bp[{act_dim}] = {{{fmt(bp)}}};")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"Exported real actor -> C header: {path} "
+          f"({obs_dim}-{h1}-{h2}-{act_dim}, {os.path.getsize(path)} bytes)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3. MEASURED LEARNED-VS-HANDCRAFTED BENCHMARK (native task)
+# ═══════════════════════════════════════════════════════════════
+
+def _rollout(env, act_fn, seed):
+    """Run one episode; act_fn(drone_idx, obs, env) -> discrete action."""
+    obs = env.reset(seed=seed)
+    hist = np.zeros(5, dtype=int)
+    for _ in range(env.max_steps):
+        actions = np.zeros(env.n_drones, dtype=int)
+        for i in range(env.n_drones):
+            if env.drones[i]["alive"]:
+                a = act_fn(i, obs[i], env)
+                actions[i] = a
+                hist[int(a)] += 1
+        obs, _, dones, infos = env.step(actions)
+        if all(dones):
+            break
+    return {
+        "safety": sum(1 for d in env.drones if d["alive"]) / env.n_drones * 100.0,
+        "total_coverage": float(infos[0].get("total_coverage", 0.0)),
+        "cells": float(max((len(d["visited"]) for d in env.drones), default=0)),
+        "alive_steps": float(max((d["alive_steps"] for d in env.drones), default=0)),
+        "perimeter": float(np.mean([infos[i].get("perimeter_frac", 0.0)
+                                     for i in range(env.n_drones)])),
+        "fire_dist": float(np.mean([infos[i].get("fire_dist", 0.0)
+                                     for i in range(env.n_drones)
+                                     if infos[i].get("alive", False)])),
+        "act_hist": [int(x) for x in hist],  # [hover, col+, col-, row+, row-]
     }
-    
-    print(f"\n--- Results ---")
-    print(f"  Mean position error: {stats['mean_error']:.3f} m")
-    print(f"  Max position error:  {stats['max_error']:.3f} m")
-    print(f"  RMS position error:  {stats['rms_error']:.3f} m")
-    print(f"  Mean velocity:       {stats['mean_velocity']:.3f} m/s")
-    print(f"  Max velocity:        {stats['max_velocity']:.3f} m/s")
-    print(f"  Position std:        {stats['position_std']:.3f} m")
-    
-    return stats
 
 
-def compare_controllers(wind_speed=15.0, duration=30.0, n_trials=5):
-    """Compare PID vs MARAHS policy under wind."""
-    print(f"\n{'='*60}")
-    print(f"Controller Comparison | Wind={wind_speed} m/s | {n_trials} trials")
-    print(f"{'='*60}")
-    
-    policy = CrazyfliePolicy()
-    
-    # PID controller (baseline)
-    class PIDController:
-        def __init__(self):
-            self.kp = 2.0
-            self.kd = 1.0
-            self.prev_error = np.zeros(2)
-        
-        def forward(self, state):
-            error = state[:2]
-            velocity = state[2:4]
-            derivative = (error - self.prev_error) / 0.02
-            self.prev_error = error.copy()
-            return -(self.kp * error + self.kd * derivative)
-    
-    pid = PIDController()
-    
-    marahs_results = []
-    pid_results = []
-    
-    for trial in range(n_trials):
-        marahs_stats = simulate_crazyflie(policy, wind_speed, duration)
-        pid_stats = simulate_crazyflie(pid, wind_speed, duration)
-        marahs_results.append(marahs_stats)
-        pid_results.append(pid_stats)
-    
-    print(f"\n--- Aggregate ({n_trials} trials) ---")
-    print(f"{'Controller':<15s} {'Mean Err (m)':>12s} {'Max Err (m)':>12s} {'RMS (m)':>10s}")
-    print("-" * 50)
-    
-    for name, results in [("MARAHS", marahs_results), ("PID", pid_results)]:
-        mean_err = np.mean([r['mean_error'] for r in results])
-        max_err = np.mean([r['max_error'] for r in results])
-        rms = np.mean([r['rms_error'] for r in results])
-        print(f"{name:<15s} {mean_err:12.3f} {max_err:12.3f} {rms:10.3f}")
-    
-    return marahs_results, pid_results
+def _learned_act(net, obs_dim):
+    def act_fn(i, obs, env):
+        o = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+        a, _, _ = net.get_action(o, deterministic=True)
+        return int(a[0])
+    return act_fn
 
 
-def create_deployment_guide():
-    """Create step-by-step deployment guide for Crazyflie."""
-    guide = """
-# MARAHS Crazyflie Deployment Guide
+def _random_act(rng):
+    def act_fn(i, obs, env):
+        return int(rng.integers(0, 5))
+    return act_fn
 
-## Hardware Required
-- Bitcraze Crazyflie 2.1 ($199): https://www.bitcraze.io/products/crazyflie-2-1/
-- Flow deck v2 ($79): https://www.bitcraze.io/products/flow-deck-v2/
-- Crazyradio PA ($39): https://www.bitcraze.io/products/crazyradio-pa/
-- High-velocity fan (15-25 m/s): ~$50-100
 
-**Total cost: ~$370-420**
+def _greedy_act():
+    """Move toward the nearest unvisited cell (frontier heuristic)."""
+    def act_fn(i, obs, env):
+        pos = np.asarray(env.drones[i]["pos"], dtype=int)
+        unvisited = np.argwhere(~env._visited_grid)
+        if len(unvisited) == 0:
+            return 0
+        dists = np.abs(unvisited - pos).sum(axis=1)
+        target = unvisited[np.argmin(dists)]
+        d = np.sign(target - pos)
+        # action_deltas: 0 hover | 1 [0,+1] | 2 [0,-1] | 3 [+1,0] | 4 [-1,0]
+        # pos[0] is the first grid axis, pos[1] the second.
+        if d[0] != 0:
+            return 3 if d[0] > 0 else 4
+        if d[1] != 0:
+            return 1 if d[1] > 0 else 2
+        return 0
+    return act_fn
 
-## Software Setup
-```bash
-# Install Crazyflie client
-pip install cflib
 
-# Flash firmware with custom deck support
-cd crazyflie-firmware
-make BOARD=cf21 LIB=IMU_BIMU deck-flow
+def benchmark(checkpoint, n_episodes, winds=(0.0, 12.0), out="learned_vs_handcrafted.json"):
+    """Learned actor vs Random / Greedy on the actor's native env."""
+    import paper_ready_train as prt
 
-# Connect Crazyflie and flash
-cfclient
-```
+    net, kind, obs_dim, act_dim = load_actor(checkpoint)
+    if obs_dim != prt.WildfireEnv().obs_dim:
+        raise ValueError(
+            f"{checkpoint}: actor expects obs_dim={obs_dim}, but the native "
+            f"paper_ready_train env has obs_dim={prt.WildfireEnv().obs_dim}. "
+            f"Cannot evaluate this checkpoint on that task — refusing rather "
+            f"than silently mismatching observations."
+        )
 
-## Policy Deployment
-1. Export policy: `python crazyflie_deploy.py --export`
-2. Copy `crazyflie_policy.h` to firmware/src/decks/
-3. Rebuild and flash firmware
-4. Policy runs at 100Hz on Crazyflie's STM32F4 MCU
+    policies = {
+        "learned": lambda: _learned_act(net, obs_dim),
+        "random": lambda: _random_act(np.random.default_rng(0)),
+        "greedy_frontier": _greedy_act,
+    }
+    results = {"meta": {
+        "checkpoint": checkpoint, "kind": kind, "obs_dim": obs_dim, "act_dim": act_dim,
+        "task": "MARAHS wildfire perimeter (paper_ready_train.WildfireEnv, 30x30, 10 drones)",
+        "n_episodes": n_episodes, "winds": list(winds),
+        "note": "fresh episodes, identical seeds per policy; deterministic actions",
+    }, "episodes": {}}
+    for wind in winds:
+        results["episodes"][str(wind)] = {}
+        env = prt.WildfireEnv(grid=30, n_drones=10, max_steps=300, wind_speed=wind)
+        for name, make in policies.items():
+            acts = make()
+            ep = [_rollout(env, acts, seed=10000 + e) for e in range(n_episodes)]
+            agg = {k: float(np.mean([r[k] for r in ep])) for k in ep[0] if k != "act_hist"}
+            agg.update({f"{k}_std": float(np.std([r[k] for r in ep])) for k in ep[0] if k != "act_hist"})
+            agg["act_hist"] = np.mean([r["act_hist"] for r in ep], axis=0).round(1).tolist()
+            results["episodes"][str(wind)][name] = agg
+            print(f"  wind={wind:>5}: {name:<16} safety={agg['safety']:5.1f}% "
+                  f"perimeter={agg['perimeter']:5.2f} coverage={agg['total_coverage']:5.1f} "
+                  f"actions={agg['act_hist']}")
+    with open(out, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nSaved measured results -> {out}")
+    return results
 
-## Experimental Protocol
-1. Place fan at 1.5m distance from Crazyflie
-2. Set fan speed to target wind speed (measure with anemometer)
-3. Launch Crazyflie and command position hold at (0, 0)
-4. Record position data via Crazyradio for 30 seconds
-5. Repeat at wind speeds: 5, 10, 15, 20, 25 m/s
-6. Compare PID vs MARAHS position error
 
-## Expected Results
-- PID: drifts >0.5m at wind >15 m/s, crashes at >20 m/s
-- MARAHS: holds position within ±0.2m at wind up to 25 m/s
-
-## Data Format
-Log files are CSV with columns:
-- timestamp, x, y, z, vx, vy, vz, wind_x, wind_y
-- Logged at 100Hz via Crazyradio
-
-## Citation
-If you use this deployment code, please cite:
-@article{basu2026marahs,
-  title={MARAHS: Multi-Agent Robust Autonomous Hazard Swarm},
-  author={Basu, Shaurjesh},
-  year={2026}
-}
-"""
-    with open('CRAZYFLIE_DEPLOYMENT.md', 'w') as f:
-        f.write(guide)
-    print("Created CRAZYFLIE_DEPLOYMENT.md")
-
+# ═══════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--export', action='store_true', help='Export policy to ONNX + C header')
-    parser.add_argument('--simulate', action='store_true', help='Run simulation-only validation')
-    parser.add_argument('--deploy', action='store_true', help='Deploy to real Crazyflie (requires hardware)')
-    parser.add_argument('--wind', type=float, default=15.0, help='Wind speed for testing')
-    parser.add_argument('--guide', action='store_true', help='Create deployment guide')
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--checkpoint", default="ppo_best.pt",
+                        help="Path to a real .pt checkpoint (default: ppo_best.pt)")
+    parser.add_argument("--export", action="store_true",
+                        help="Export the REAL actor weights to C header (+ ONNX if installed)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Measure learned actor vs Random/Greedy on its native task")
+    parser.add_argument("--episodes", type=int, default=6)
+    parser.add_argument("--out-header", default="crazyflie_policy.h")
+    parser.add_argument("--out-onnx", default="crazyflie_policy.onnx")
     args = parser.parse_args()
-    
-    if args.guide:
-        create_deployment_guide()
-    elif args.export:
-        policy = CrazyfliePolicy()
-        policy.export_onnx()
-        policy.export_c_header()
-    elif args.simulate or args.deploy:
-        policy = CrazyfliePolicy()
-        
-        # Run comparison at multiple wind speeds
-        all_stats = {}
-        for wind in [5, 10, 15, 20, 25]:
-            marahs, pid = compare_controllers(wind_speed=wind, duration=30.0, n_trials=3)
-            all_stats[str(wind)] = {
-                'marahs': {
-                    'mean_error': float(np.mean([r['mean_error'] for r in marahs])),
-                    'max_error': float(np.mean([r['max_error'] for r in marahs])),
-                    'rms_error': float(np.mean([r['rms_error'] for r in marahs])),
-                },
-                'pid': {
-                    'mean_error': float(np.mean([r['mean_error'] for r in pid])),
-                    'max_error': float(np.mean([r['max_error'] for r in pid])),
-                    'rms_error': float(np.mean([r['rms_error'] for r in pid])),
-                },
-            }
-        
-        with open('sim_to_real_results.json', 'w') as f:
-            json.dump(all_stats, f, indent=2)
-        print(f"\nResults saved to sim_to_real_results.json")
-    else:
+
+    if not (args.export or args.benchmark):
         parser.print_help()
+        raise SystemExit(0)
+
+    kind, obs_dim, act_dim = inspect_checkpoint(args.checkpoint)
+    print(f"Checkpoint {args.checkpoint}: kind={kind} obs_dim={obs_dim} act_dim={act_dim}")
+
+    if args.export:
+        net, kind, obs_dim, act_dim = load_actor(args.checkpoint)
+        export_c_header(net, obs_dim, act_dim, args.out_header, args.checkpoint)
+        try:
+            export_onnx(net, obs_dim, args.out_onnx)
+        except RuntimeError as e:
+            print(f"  (skipped) {e}")
+
+    if args.benchmark:
+        benchmark(args.checkpoint, n_episodes=args.episodes)
