@@ -555,6 +555,76 @@ L5 & 0.275 & 0.328 & 0.247 & 5.79 & 5.97 & 5.76 \\
 \end{table}
 
 % ───────────────────────────────────────────────────────────────────────────
+\subsection{Sim-to-real: a learned disturbance observer on the wind-hold task}
+\label{sec:observer}
+% ───────────────────────────────────────────────────────────────────────────
+
+The bridge from grid-world failure levels to physical wind is the
+\texttt{macondo\_hover} 1-DOF wind-hold plant: a PD+I position loop acting
+through a first-order rotor lag ($\tau_{rot}=25$~ms) on a lagged, noisy
+accelerometer, with an optional disturbance-observer feedforward that
+estimates the drag specific force $w$ and subtracts it from the command. The
+analytic observer is a first-order low-pass on the direct measurement
+$a_{meas}-u_{act}$ ($\tau_{obs}=30$~ms): exact in steady state, lagged on
+transients. We measured whether a small learned estimator (MLP
+$60{\to}128{\to}64$, 20~ms causal window of $[a_{meas},\,u_{act},\,v]$,
+trained to predict $w(k{+}5)$ under domain randomization of mass, drag area,
+rotor and sensor lag, noise, and gust shape; \texttt{learned\_observer.py})
+plus one learned-in-the-loop round (retraining on its own rollouts,
+\texttt{--retrain-loop 1}) can beat it in closed loop. Table~\ref{tab:observer} reports peak and RMS
+hold error at 20 seeds with identical wind/noise draws per controller
+(5~s horizons, IQM $\pm$ 95\% bootstrap CI per the openrescue protocol,
+Agarwal et al.~2021).
+
+\begin{table}[h]
+\centering
+\caption{Closed-loop wind-hold error on the macondo plant
+(\texttt{learned\_observer.json}), IQM $\pm$ 95\% bootstrap CI over 20 seeds
+with identical wind and noise draws per controller. The TWR-5 airframe
+saturates under 50 mph with 25\% turbulence (\texttt{authority\_limit});
+the other scenarios are holdable.}
+\label{tab:observer}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+ & \multicolumn{2}{c}{PD+I only} & \multicolumn{2}{c}{analytic obs.} & \multicolumn{2}{c}{learned obs.} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Scenario & peak & rms & peak & rms & peak & rms \\
+\midrule
+nominal 50 mph step & 27.65 & 23.81 & 6.34 & 1.13 & 3.29 & 0.58 \\
+OOD airframe & 29.95 & 25.79 & 6.87 & 1.23 & 3.61 & 0.64 \\
+turbulent wind & 227.1 & 119.9 & 191.9 & 93.2 & 180.7 & 87.1 \\
+authority limit & 1046.4 & 719.9 & 994.1 & 681.4 & 988.2 & 673.1 \\
+high sensor noise & 27.65 & 23.81 & 6.34 & 1.13 & 3.28 & 0.58 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The learned estimator reduces peak deviation on the in-distribution 50 mph
+step gust from 6.34 cm (analytic) to 3.29 cm ($-48\%$), retains that gain on
+an out-of-distribution airframe whose mass and drag sit outside the training
+ranges (6.87$\to$3.61 cm) and under heavy sensor noise (twice the
+largest noise seen in training; the un-observed PD+I row is unchanged because
+it never reads the accelerometer). In these three holdable, deterministic
+scenarios the 20-seed 95\% CIs are tight and disjoint (learned [3.3, 3.3] vs
+analytic [6.3, 6.3] cm on the nominal gust), so the gain is statistically
+separated. On turbulent wind the point estimates still favor the learned
+estimator (191.9$\to$180.7 cm peak IQM, $-7\%$ RMS) but seed-to-seed
+variance is large and the 95\% CIs overlap (learned [0.7, 569.9] vs analytic
+[1.5, 601.0] cm), consistent with the direct estimator-quality measurement on
+a held-out turbulent trajectory: learned 5-ms-ahead prediction RMSE 0.42 vs
+analytic tracking RMSE 1.13~m/s$^2$. The limit of the framework is physical,
+not algorithmic: at 50 mph with 25\% turbulence intensity the TWR-5 airframe
+saturates its horizontal authority on roughly a quarter to a third of control
+steps (IQM 25--29\%) and all three controllers drift about 10~m (IQM peak;
+the CIs span 0.7--3050 cm, so no controller separates there) --- a measured
+upper bound for the hardware phase, not a failure of the estimator. We deliberately do not relabel this a
+``PINN'' or ``physics-informed'' network: the analytic observer already
+realizes the exact law $w = m a - F_{thrust}$, and the learned estimator's
+measured value is prediction (a 5 ms lead) and denoising, not physics
+discovery.
+
+% ───────────────────────────────────────────────────────────────────────────
 \subsection{Limitations}
 % ───────────────────────────────────────────────────────────────────────────
 
@@ -569,7 +639,10 @@ comparisons valid, cross-horizon ones are not. (iii) The grid world is a
 proxy for flight: sensor noise, packet loss and GPS denial are injected
 stochastically rather than driven by a physics model, so the mapping from
 physical wind speed to failure level (the \texttt{macondo\_hover} wind model)
-remains a calibration step for the hardware phase, not a validated law. A deployment gate is now also measured rather than assumed: legacy learned checkpoints fail on the task they were trained for (\S\ref{sec:learned}), so the hardware phase will upload the hand-crafted state machine, with the OpenRescue-trained PPO (coverage parity at L2--L4 but an L2--L3 agent-loss penalty) as the learned candidate once its seed count matches the paper protocol. No physical position-hold result is claimed anywhere in this work.
+remains a calibration step for the hardware phase, not a validated law; the
+controller-level ablation of \S\ref{sec:observer} is measured, including an
+authority limit---a TWR-5 airframe spends roughly a quarter to a third of its
+control steps saturated (IQM) at 50 mph with 25\% turbulence intensity. A deployment gate is now also measured rather than assumed: legacy learned checkpoints fail on the task they were trained for (\S\ref{sec:learned}), so the hardware phase will upload the hand-crafted state machine, with the OpenRescue-trained PPO (coverage parity at L2--L4 but an L2--L3 agent-loss penalty) as the learned candidate once its seed count matches the paper protocol. No physical position-hold result is claimed anywhere in this work.
 (iv) The learned baseline of \S\ref{sec:learned} is a single 1500-episode PPO run with a 6-seed evaluation whose CIs overlap everywhere; it has no memory or communication head, and its L1/L5 gap likely reflects sample efficiency, not a ceiling. Checkpoints trained on other tasks (wildfire MAPPO/IPPO/GAT) are excluded---measured on their native task they fail the deployment gate---and legacy claims that did not come from measurement (random weights exported as ``trained'', an unmeasured $\pm 0.2$~m hold) were removed from the repository.
 
 \begin{figure}[h]
