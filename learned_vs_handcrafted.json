@@ -1,0 +1,147 @@
+{
+  "meta": {
+    "checkpoint": "ppo_best.pt",
+    "kind": "actor",
+    "obs_dim": 656,
+    "act_dim": 5,
+    "task": "MARAHS wildfire perimeter (paper_ready_train.WildfireEnv, 30x30, 10 drones)",
+    "n_episodes": 8,
+    "winds": [
+      0.0,
+      12.0
+    ],
+    "note": "fresh episodes, identical seeds per policy; deterministic actions"
+  },
+  "episodes": {
+    "0.0": {
+      "learned": {
+        "safety": 77.5,
+        "total_coverage": 7.361111111111111,
+        "cells": 14.25,
+        "alive_steps": 300.0,
+        "perimeter": 15.221502376034028,
+        "fire_dist": 3.507762345299125,
+        "safety_std": 14.79019945774904,
+        "total_coverage_std": 1.2244298244741214,
+        "cells_std": 5.825590098865522,
+        "alive_steps_std": 0.0,
+        "perimeter_std": 7.758486858791589,
+        "fire_dist_std": 1.4792646377495888,
+        "act_hist": [
+          2480.1,
+          57.8,
+          50.8,
+          26.0,
+          13.0
+        ]
+      },
+      "random": {
+        "safety": 35.0,
+        "total_coverage": 43.47222222222222,
+        "cells": 75.375,
+        "alive_steps": 300.0,
+        "perimeter": 25.009270771651988,
+        "fire_dist": 10.823736814657847,
+        "safety_std": 15.811388300841896,
+        "total_coverage_std": 3.860111781148696,
+        "cells_std": 15.148741696919913,
+        "alive_steps_std": 0.0,
+        "perimeter_std": 13.043023226232188,
+        "fire_dist_std": 1.6749214694421086,
+        "act_hist": [
+          378.8,
+          364.2,
+          369.0,
+          361.9,
+          373.2
+        ]
+      },
+      "greedy_frontier": {
+        "safety": 96.25,
+        "total_coverage": 8.055555555555555,
+        "cells": 13.875,
+        "alive_steps": 300.0,
+        "perimeter": 4.549916457811194,
+        "fire_dist": 10.014377855261166,
+        "safety_std": 4.841229182759271,
+        "total_coverage_std": 0.950957931590205,
+        "cells_std": 1.0532687216470449,
+        "alive_steps_std": 0.0,
+        "perimeter_std": 4.890321219001642,
+        "fire_dist_std": 3.043740225650444,
+        "act_hist": [
+          10.0,
+          6.6,
+          119.6,
+          0.0,
+          2753.4
+        ]
+      }
+    },
+    "12.0": {
+      "learned": {
+        "safety": 92.5,
+        "total_coverage": 17.15277777777778,
+        "cells": 27.375,
+        "alive_steps": 300.0,
+        "perimeter": 5.538737287104933,
+        "fire_dist": 11.949773412280614,
+        "safety_std": 4.330127018922194,
+        "total_coverage_std": 2.5494719254711224,
+        "cells_std": 2.6896793489187516,
+        "alive_steps_std": 0.0,
+        "perimeter_std": 3.009311873131211,
+        "fire_dist_std": 2.578261641332384,
+        "act_hist": [
+          2796.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "random": {
+        "safety": 71.25,
+        "total_coverage": 43.861111111111114,
+        "cells": 63.25,
+        "alive_steps": 300.0,
+        "perimeter": 19.06884043736177,
+        "fire_dist": 10.721769552122034,
+        "safety_std": 11.659223816361019,
+        "total_coverage_std": 4.30824288894248,
+        "cells_std": 6.832825184358224,
+        "alive_steps_std": 0.0,
+        "perimeter_std": 15.287966872810783,
+        "fire_dist_std": 2.9963629727581793,
+        "act_hist": [
+          477.4,
+          459.1,
+          472.0,
+          462.0,
+          472.5
+        ]
+      },
+      "greedy_frontier": {
+        "safety": 88.75,
+        "total_coverage": 11.222222222222221,
+        "cells": 20.125,
+        "alive_steps": 300.0,
+        "perimeter": 2.679647701981467,
+        "fire_dist": 10.06664021677441,
+        "safety_std": 15.360257159305634,
+        "total_coverage_std": 1.6823337699696361,
+        "cells_std": 6.641488914392616,
+        "alive_steps_std": 0.0,
+        "perimeter_std": 1.793400879558004,
+        "fire_dist_std": 4.06748865908383,
+        "act_hist": [
+          10.0,
+          0.0,
+          75.2,
+          0.0,
+          2716.4
+        ]
+      }
+    }
+  }
+}
